@@ -1,0 +1,14 @@
+{
+  "name": "discord-mcp-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server bridging a Claude Code agent to a running Discord (Vencord) renderer.",
+  "scripts": {
+    "start": "bun server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3"
+  }
+}
