@@ -12,14 +12,22 @@
  * Discord's live runtime (webpack modules, the DOM, minified class names)
  * instead of guessing blind.
  *
- * Renderer-only, no patches: after enabling/disabling just press Ctrl+R.
+ * A Claude icon sits at the right end of Discord's top bar: click it to turn
+ * the bridge on/off. The choice is a persisted plugin setting, so it survives
+ * Discord restarts and Ctrl+R. Adding the icon needs a header-bar patch, so
+ * deploying a change to this file needs a Vencord rebuild (not just Ctrl+R).
  *
- * SECURITY: while enabled, this evaluates arbitrary JavaScript inside your
+ * SECURITY: while ACTIVE, this evaluates arbitrary JavaScript inside your
  * Discord client. It only talks to localhost and authenticates with a shared
- * token. Keep it DISABLED unless you are actively using the bridge.
+ * token. Click the toolbar icon to pause it whenever you are not debugging.
  */
 
-import definePlugin, { PluginNative } from "@utils/types";
+import { definePluginSettings } from "@api/Settings";
+import ErrorBoundary from "@components/ErrorBoundary";
+import definePlugin, { OptionType, PluginNative } from "@utils/types";
+import { findComponentByCodeLazy } from "@webpack";
+import { useEffect, useState } from "@webpack/common";
+import type { PropsWithChildren } from "react";
 
 const TOKEN = "vc-debug-bridge-2f9a4c1e";          // must match the MCP server
 const BASES = ["http://localhost:8787", "http://127.0.0.1:8787"];
@@ -37,10 +45,45 @@ const Native = VencordNative.pluginHelpers.DebugBridge as
 
 interface LogEntry { level: string; time: string; text: string; }
 
-let stopped = false;
+/* ------------------------------------------------------------ settings -- */
+
+/**
+ * `bridgeActive` is the on/off switch behind the toolbar icon. It is a normal
+ * persisted plugin setting, so the choice survives Discord restarts and
+ * Ctrl+R. `onChange` fires for both the toolbar click and the settings panel,
+ * so `applyBridgeState` is the single place that starts/stops the poll loop.
+ */
+const settings = definePluginSettings({
+    bridgeActive: {
+        type: OptionType.BOOLEAN,
+        default: false,
+        description: "Bridge active — let a local Claude Code agent inspect and control this client",
+        onChange: (active: boolean) => applyBridgeState(active),
+    },
+});
+
+/**
+ * Generation token for the poll loop. Every start/stop bumps it; a running
+ * loop keeps going only while its captured `gen` still equals `pollGen`. This
+ * makes start/stop idempotent and race-free — a toggle can never wedge the
+ * bridge into a state with zero live loops (or two).
+ */
+let pollGen = 0;
 let baseIndex = 0;
 let connected = false;
 let currentAbort: AbortController | undefined;
+
+/**
+ * `connected` changes outside React (in the poll loop). The toolbar icon needs
+ * to re-render the instant it flips, so writes go through `setConnected`, which
+ * notifies subscribers — no polling, no lag. Always assign via this helper.
+ */
+const connectionListeners = new Set<() => void>();
+function setConnected(value: boolean): void {
+    if (connected === value) return;
+    connected = value;
+    connectionListeners.forEach(cb => { try { cb(); } catch { /* */ } });
+}
 
 const consoleBuffer: LogEntry[] = [];
 const origConsole: Partial<Record<"error" | "warn", (...a: any[]) => void>> = {};
@@ -218,7 +261,7 @@ async function pollOnce(): Promise<void> {
     try {
         res = await fetch(base + "/poll?token=" + TOKEN, { method: "POST", signal: ctrl.signal });
     } catch (e) {
-        connected = false;
+        setConnected(false);
         baseIndex++;                       // network / abort error — try the other host next
         throw e;
     } finally {
@@ -226,7 +269,7 @@ async function pollOnce(): Promise<void> {
     }
 
     if (!connected) origConsole.warn?.call(console, "[DebugBridge] connected:", base);
-    connected = true;
+    setConnected(true);
 
     if (res.status === 204 || !res.ok) return;          // no command waiting — re-poll
 
@@ -244,15 +287,48 @@ async function pollOnce(): Promise<void> {
     } catch { /* result lost — that server call will time out; carry on */ }
 }
 
-async function pollLoop(): Promise<void> {
-    while (!stopped) {
+async function pollLoop(gen: number): Promise<void> {
+    while (gen === pollGen) {
         try {
             await pollOnce();
         } catch {
-            connected = false;
-            if (!stopped) await sleep(BACKOFF_MS);
+            setConnected(false);
+            if (gen === pollGen) await sleep(BACKOFF_MS);
         }
     }
+}
+
+/* ------------------------------------------------------ poll lifecycle -- */
+
+/**
+ * Stop the long-poll loop and abort any in-flight request. Idempotent.
+ * Bumping `pollGen` retires the running loop: it exits at its next check,
+ * including mid-way through the post-error backoff sleep.
+ */
+function stopPolling(): void {
+    pollGen++;
+    setConnected(false);
+    try { currentAbort?.abort(); } catch { /* */ }
+    currentAbort = undefined;
+}
+
+/**
+ * (Re)start the long-poll loop, guaranteeing exactly one live loop afterwards.
+ * Idempotent and safe under rapid toggling: `stopPolling` first retires any
+ * existing loop, then the loop started here owns the fresh `pollGen`.
+ */
+function startPolling(): void {
+    stopPolling();
+    const gen = pollGen;
+    baseIndex = 0;
+    setConnected(false);
+    void pollLoop(gen);
+}
+
+/** Bring the poll loop in line with the desired active state. */
+function applyBridgeState(active: boolean): void {
+    if (active) startPolling();
+    else stopPolling();
 }
 
 /* ------------------------------------------------------ console capture -- */
@@ -294,34 +370,117 @@ function removeConsoleCapture(): void {
     onError = onRejection = undefined;
 }
 
+/* -------------------------------------------------------- toolbar icon -- */
+
+/** Discord's header-bar icon button — the inbox / help cluster, top right. */
+const HeaderBarIcon = findComponentByCodeLazy(".HEADER_BAR_BADGE_BOTTOM,", 'position:"bottom"');
+
+/** Official Claude logomark (Simple Icons, 24×24 viewBox). */
+const CLAUDE_LOGO_PATH = "m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z";
+
+/**
+ * Claude burst — clay orange when the bridge is active, muted when paused.
+ * `pulsing` adds a slow SMIL fill animation: a breathing "live" indicator
+ * shown while the bridge is genuinely connected to the daemon.
+ */
+function ClaudeIcon({ active, pulsing }: { active: boolean; pulsing: boolean; }) {
+    return (
+        <svg viewBox="0 0 24 24" width={18} height={18}>
+            <path fill={active ? "#D97757" : "currentColor"} d={CLAUDE_LOGO_PATH}>
+                {pulsing && (
+                    <animate
+                        attributeName="fill"
+                        values="#D97757;#F4AC8C;#D97757"
+                        dur="1.8s"
+                        repeatCount="indefinite"
+                    />
+                )}
+            </path>
+        </svg>
+    );
+}
+
+/**
+ * The toolbar button — click toggles the bridge; colour tracks state. The icon
+ * pulses while the bridge is live, so it subscribes to `connectionListeners`
+ * and re-renders the instant `connected` flips — no polling, no lag.
+ */
+function ClaudeBridgeButton() {
+    const { bridgeActive } = settings.use(["bridgeActive"]);
+    const [online, setOnline] = useState(connected);
+    useEffect(() => {
+        const sync = () => setOnline(connected);
+        connectionListeners.add(sync);
+        sync();                            // catch a flip between render and effect
+        return () => { connectionListeners.delete(sync); };
+    }, []);
+
+    const live = bridgeActive && online;
+    return (
+        <HeaderBarIcon
+            tooltip={!bridgeActive
+                ? "Claude bridge OFF — click to let Claude Code connect."
+                : live
+                    ? "Claude bridge ON — agent connected. Click to pause."
+                    : "Claude bridge ON — waiting for Claude Code…"}
+            icon={() => <ClaudeIcon active={bridgeActive} pulsing={live} />}
+            selected={bridgeActive}
+            onClick={() => { settings.store.bridgeActive = !settings.store.bridgeActive; }}
+        />
+    );
+}
+
 /* -------------------------------------------------------------- plugin -- */
 
 export default definePlugin({
     name: "DebugBridge",
     description:
         "Live debugging bridge — lets a local Claude Code agent inspect and eval inside " +
-        "this Discord client over localhost HTTP (token-gated). Keep disabled when not in use.",
+        "this Discord client over localhost HTTP (token-gated). Toggle it from the toolbar.",
     authors: [{ name: "fagner", id: 0n }],
 
+    settings,
+
+    // Append the Claude toggle into the header bar's trailing (right) slot.
+    patches: [
+        {
+            find: '?"BACK_FORWARD_NAVIGATION":',
+            replacement: {
+                match: /(trailing:.{0,50}?)\i\.Fragment,(?=\{children:\[)/,
+                replace: "$1$self.TrailingWrapper,"
+            }
+        }
+    ],
+
+    TrailingWrapper({ children }: PropsWithChildren) {
+        return (
+            <>
+                {children}
+                <ErrorBoundary key="vc-debugbridge" noop>
+                    <ClaudeBridgeButton />
+                </ErrorBoundary>
+            </>
+        );
+    },
+
     start() {
-        stopped = false;
+        pollGen++; // retire any loop left over from a prior start
         baseIndex = 0;
-        connected = false;
+        setConnected(false);
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 4,
+            version: 8,
             console: consoleBuffer,
             isConnected: () => connected,
+            isActive: () => settings.store.bridgeActive,
         };
-        void pollLoop();
+        // Resume whatever state the toolbar icon was left in last session.
+        if (settings.store.bridgeActive) startPolling();
     },
 
     stop() {
-        stopped = true;
-        connected = false;
-        try { currentAbort?.abort(); } catch { /* */ }
-        currentAbort = undefined;
+        stopPolling();
         removeConsoleCapture();
         delete (globalThis as any).$discordBridge;
     },
