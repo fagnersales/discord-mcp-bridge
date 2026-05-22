@@ -24,6 +24,7 @@ const POLL_HOLD_MS = 25_000;                  // how long /poll is held open wit
 const PLUGIN_STALE_MS = 40_000;               // no poll within this -> plugin "disconnected"
 const DEFAULT_DEPTH = 8;                      // result serialization depth when unspecified
 const RELOAD_DEADLINE_MS = 35_000;            // how long /reload waits for Discord to return
+const SCREENSHOT_TIMEOUT_MS = 30_000;         // capture + encode + transfer of a base64 image
 
 const LOG_FILE = new URL("./daemon.log", import.meta.url).pathname;
 const STARTED_AT = Date.now();
@@ -38,7 +39,7 @@ const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 /* ---------------------------------------------------------------- bridge -- */
 
-interface Command { id: string; code: string; depth: number; }
+interface Command { id: string; code: string; depth: number; kind?: "screenshot"; }
 interface BridgeReply { id: string; ok: boolean; result?: unknown; error?: string; }
 
 let nextId = 1;
@@ -61,8 +62,10 @@ function deliver(cmd: Command) {
     else commandQueue.push(cmd);
 }
 
-/** Queue code for the plugin and await its reply. */
-function bridgeEval(code: string, depth = DEFAULT_DEPTH, timeoutMs = CALL_TIMEOUT_MS): Promise<BridgeReply> {
+/** Queue a command for the plugin and await its reply. */
+function queueCommand(
+    code: string, depth: number, timeoutMs: number, kind?: Command["kind"],
+): Promise<BridgeReply> {
     return new Promise((resolve, reject) => {
         if (!pluginConnected()) {
             reject(new Error(
@@ -77,8 +80,13 @@ function bridgeEval(code: string, depth = DEFAULT_DEPTH, timeoutMs = CALL_TIMEOU
             reject(new Error(`Bridge call timed out after ${timeoutMs}ms with no reply from the Discord plugin.`));
         }, timeoutMs);
         pending.set(id, { resolve, reject, timer });
-        deliver({ id, code, depth });
+        deliver({ id, code, depth, kind });
     });
+}
+
+/** Queue code for the plugin to eval and await its reply. */
+function bridgeEval(code: string, depth = DEFAULT_DEPTH, timeoutMs = CALL_TIMEOUT_MS): Promise<BridgeReply> {
+    return queueCommand(code, depth, timeoutMs);
 }
 
 /**
@@ -226,6 +234,17 @@ async function handleHttp(req: Request): Promise<Response> {
         const depthRaw = parseInt(url.searchParams.get("depth") ?? "", 10);
         const depth = Number.isFinite(depthRaw) ? Math.max(1, Math.min(20, depthRaw)) : DEFAULT_DEPTH;
         try { return jsonCors(await bridgeEval(code, depth)); }
+        catch (e) { return jsonCors({ ok: false, error: errMsg(e) }, 502); }
+    }
+
+    // capture a screenshot of the renderer; body is JSON {selector?, ...opts}
+    if (req.method === "POST" && url.pathname === "/screenshot") {
+        let opts = "{}";
+        try {
+            const body = await req.text();
+            if (body.trim()) { JSON.parse(body); opts = body; }   // validate, then forward verbatim
+        } catch { return jsonCors({ ok: false, error: "request body is not valid JSON" }, 400); }
+        try { return jsonCors(await queueCommand(opts, DEFAULT_DEPTH, SCREENSHOT_TIMEOUT_MS, "screenshot")); }
         catch (e) { return jsonCors({ ok: false, error: errMsg(e) }, 502); }
     }
 

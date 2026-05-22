@@ -19,13 +19,21 @@
  * token. Keep it DISABLED unless you are actively using the bridge.
  */
 
-import definePlugin from "@utils/types";
+import definePlugin, { PluginNative } from "@utils/types";
 
 const TOKEN = "vc-debug-bridge-2f9a4c1e";          // must match the MCP server
 const BASES = ["http://localhost:8787", "http://127.0.0.1:8787"];
 const POLL_ABORT_MS = 35_000;                       // > the server's 25s long-poll hold
 const BACKOFF_MS = 2_000;                           // wait after a network error
 const CONSOLE_LIMIT = 200;
+
+/**
+ * Native (main-process) helpers — see native.ts. Vencord populates this at
+ * startup; it is `undefined` if Discord has not been fully restarted since
+ * native.ts was added (a Ctrl+R reload does NOT register native handlers).
+ */
+const Native = VencordNative.pluginHelpers.DebugBridge as
+    PluginNative<typeof import("./native")> | undefined;
 
 interface LogEntry { level: string; time: string; text: string; }
 
@@ -149,6 +157,55 @@ async function buildReply(id: string, code: string, depth: number): Promise<stri
     return payload;
 }
 
+/* --------------------------------------------------------- screenshot -- */
+
+/**
+ * Handle a `kind: "screenshot"` command. `optsJson` is JSON {selector?,
+ * maxWidth?, format?, quality?}. Resolves a `selector` to a viewport rect here
+ * (the renderer owns the DOM), then hops to native.ts for the actual capture.
+ * Returns the reply JSON string — bypassing buildReply's size caps, since a
+ * base64 image legitimately runs well past the 20k-char string cap.
+ */
+async function buildScreenshotReply(id: string, optsJson: string): Promise<string> {
+    try {
+        if (!Native || typeof Native.captureScreenshot !== "function")
+            throw new Error(
+                "Native screenshot helper unavailable — fully quit and reopen Discord " +
+                "once (Ctrl+R is not enough; native handlers register only at startup).");
+
+        const opts = optsJson.trim() ? JSON.parse(optsJson) : {};
+        let rect: { x: number; y: number; width: number; height: number; } | undefined;
+
+        if (typeof opts.selector === "string" && opts.selector) {
+            const el = document.querySelector(opts.selector);
+            if (!el)
+                return JSON.stringify({ id, ok: false, error: "selector matched nothing: " + opts.selector });
+            try { el.scrollIntoView({ block: "center" }); } catch { /* */ }
+            await sleep(150);                       // let the scroll settle before capturing
+            const r = el.getBoundingClientRect();
+            const x = Math.max(0, Math.floor(r.left));
+            const y = Math.max(0, Math.floor(r.top));
+            rect = {
+                x, y,
+                width: Math.min(Math.ceil(r.width), window.innerWidth - x),
+                height: Math.min(Math.ceil(r.height), window.innerHeight - y),
+            };
+            if (rect.width < 1 || rect.height < 1)
+                return JSON.stringify({ id, ok: false, error: "element is off-screen or has zero size: " + opts.selector });
+        }
+
+        const result = await Native.captureScreenshot({
+            rect,
+            maxWidth: typeof opts.maxWidth === "number" ? opts.maxWidth : undefined,
+            format: opts.format === "jpeg" ? "jpeg" : "png",
+            quality: typeof opts.quality === "number" ? opts.quality : undefined,
+        });
+        return JSON.stringify({ id, ok: true, result });
+    } catch (e: any) {
+        return JSON.stringify({ id, ok: false, error: String((e && (e.stack || e.message)) || e) });
+    }
+}
+
 /* ------------------------------------------------------- poll transport -- */
 
 async function pollOnce(): Promise<void> {
@@ -173,12 +230,14 @@ async function pollOnce(): Promise<void> {
 
     if (res.status === 204 || !res.ok) return;          // no command waiting — re-poll
 
-    let cmd: { id?: unknown; code?: unknown; depth?: unknown };
+    let cmd: { id?: unknown; code?: unknown; depth?: unknown; kind?: unknown; };
     try { cmd = await res.json(); } catch { return; }
     if (typeof cmd.id !== "string" || typeof cmd.code !== "string") return;
 
     const depth = typeof cmd.depth === "number" && cmd.depth > 0 ? cmd.depth : 8;
-    const payload = await buildReply(cmd.id, cmd.code, depth);
+    const payload = cmd.kind === "screenshot"
+        ? await buildScreenshotReply(cmd.id, cmd.code)
+        : await buildReply(cmd.id, cmd.code, depth);
     // No custom headers / plain-text body keeps this a "simple" CORS request (no preflight).
     try {
         await fetch(base + "/result?token=" + TOKEN, { method: "POST", body: payload });
@@ -251,7 +310,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 3,
+            version: 4,
             console: consoleBuffer,
             isConnected: () => connected,
         };

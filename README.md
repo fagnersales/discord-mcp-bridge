@@ -58,6 +58,9 @@ press `Ctrl+R` — `discord_status` should then report the plugin connected.
 - `discord_click(selector, index?)` — synthetic pointer/mouse/click on an element.
 - `discord_key(combo, selector?)` — dispatch a key / shortcut, e.g. `"Ctrl+K"`.
 - `discord_console(limit?)` — recent renderer warnings / errors / uncaught.
+- `discord_screenshot({selector?, format?, maxWidth?, quality?})` — capture the
+  renderer as an image (whole window, or one element); returns it inline so the
+  agent can *see* the UI.
 - `discord_reload()` — reload the renderer and wait until the bridge reconnects.
 - `discord_wait({selector?, expr?, timeoutMs?})` — block until a selector
   appears or a JS boolean expression is truthy.
@@ -71,6 +74,8 @@ press `Ctrl+R` — `discord_status` should then report the plugin connected.
 
       curl -s -X POST 'http://localhost:8787/eval?token=vc-debug-bridge-2f9a4c1e' --data-binary 'document.title'
 
+- `POST /screenshot` — body `{selector?, ...}`; captures the renderer, returns
+  `{ok, result:{data, mimeType, width, height, bytes}}` (`data` is base64).
 - `GET /health` — daemon liveness (no plugin needed).
 - `GET /status` — daemon + plugin + renderer snapshot.
 - `POST /reload` — reload Discord, wait for reconnect.
@@ -83,6 +88,10 @@ press `Ctrl+R` — `discord_status` should then report the plugin connected.
   the `TOKEN` constant in `daemon.ts`, `server.ts`, and `debugBridge/index.tsx`.
 - The plugin polls `http://localhost`, falling back to `http://127.0.0.1`.
 - Daemon logs to `daemon.log` in this directory.
+- **Screenshots use a native helper** (`debugBridge/native.ts`,
+  `webContents.capturePage()`). Native handlers register only at Discord
+  **startup** — after first installing this, fully quit and reopen Discord
+  once; `Ctrl+R` is not enough. After that, `Ctrl+R` works as before.
 - **Security:** while enabled the plugin evals arbitrary JS inside Discord.
   Localhost-only + token. Keep it disabled when not actively debugging.
 

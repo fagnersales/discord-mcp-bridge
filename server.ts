@@ -88,7 +88,10 @@ async function daemonEval(code: string, depth?: number, timeoutMs = 20_000): Pro
 
 /* ------------------------------------------------------------- mcp glue -- */
 
-type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
+type ContentBlock =
+    | { type: "text"; text: string }
+    | { type: "image"; data: string; mimeType: string };
+type ToolResult = { content: ContentBlock[]; isError?: boolean };
 
 function text(s: string, isError = false): ToolResult {
     return { content: [{ type: "text", text: s }], isError: isError || undefined };
@@ -110,7 +113,7 @@ async function runInRenderer(code: string, depth?: number): Promise<ToolResult> 
     }
 }
 
-const mcp = new McpServer({ name: "discord-bridge", version: "2.0.0" });
+const mcp = new McpServer({ name: "discord-bridge", version: "2.1.0" });
 
 mcp.registerTool("discord_eval", {
     description:
@@ -315,6 +318,44 @@ mcp.registerTool("discord_console", {
     },
 }, async ({ limit }) => runInRenderer(
     `((globalThis.$discordBridge && globalThis.$discordBridge.console) || []).slice(-${limit ?? 40})`));
+
+mcp.registerTool("discord_screenshot", {
+    description:
+        "Capture a screenshot of the running Discord (Vencord) renderer and return it as an " +
+        "image. Use it to SEE the UI — verify a layout/styling change, inspect a component, " +
+        "or debug a visual bug — instead of guessing from the DOM. Pass `selector` to capture " +
+        "a single element (it is scrolled into view first); omit it for the whole window. " +
+        "Only the currently-visible viewport is captured; scroll or navigate first if needed.",
+    inputSchema: {
+        selector: z.string().optional().describe("CSS selector of one element to capture; omit for the full window."),
+        format: z.enum(["png", "jpeg"]).optional().describe("Image format (default png; jpeg is smaller)."),
+        maxWidth: z.number().int().min(64).max(4096).optional().describe("Scale down so width ≤ this many px (default 1600)."),
+        quality: z.number().int().min(1).max(100).optional().describe("JPEG quality 1–100 (default 85; ignored for png)."),
+    },
+}, async ({ selector, format, maxWidth, quality }) => {
+    try {
+        const res = await daemonFetch("/screenshot", {
+            method: "POST",
+            body: JSON.stringify({ selector, format, maxWidth, quality }),
+        }, 35_000);
+        const reply = (await res.json()) as BridgeReply;
+        if (!reply.ok)
+            return text("Screenshot failed:\n" + (reply.error ?? "unknown error"), true);
+        const r = reply.result as { data: string; mimeType: string; width: number; height: number; bytes: number };
+        return {
+            content: [
+                { type: "image", data: r.data, mimeType: r.mimeType },
+                {
+                    type: "text",
+                    text: `Captured ${r.width}×${r.height}px ${r.mimeType} (${Math.round(r.bytes / 1024)} KB)` +
+                        (selector ? ` of \`${selector}\`.` : "."),
+                },
+            ],
+        };
+    } catch (e) {
+        return text("Screenshot error: " + errMsg(e), true);
+    }
+});
 
 mcp.registerTool("discord_reload", {
     description:
