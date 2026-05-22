@@ -22,7 +22,7 @@ const TOKEN = "vc-debug-bridge-2f9a4c1e";     // shared secret — must match th
 const CALL_TIMEOUT_MS = 12_000;               // how long a tool call waits for a result
 const POLL_HOLD_MS = 25_000;                  // how long /poll is held open with no work
 const PLUGIN_STALE_MS = 40_000;               // no poll within this -> plugin "disconnected"
-const DEFAULT_DEPTH = 8;                      // result serialization depth when unspecified
+const DEFAULT_DEPTH = 3;                      // result serialization depth when unspecified
 const RELOAD_DEADLINE_MS = 35_000;            // how long /reload waits for Discord to return
 const SCREENSHOT_TIMEOUT_MS = 30_000;         // capture + encode + transfer of a base64 image
 

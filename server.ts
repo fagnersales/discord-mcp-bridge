@@ -30,6 +30,13 @@ const log = (...a: unknown[]) => console.error("[discord-bridge-mcp]", ...a);
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
+/** Hard cap on a single tool result — stops a runaway eval from nuking the context window. */
+const MAX_RESULT_CHARS = 16_000;
+const cap = (s: string) =>
+    s.length <= MAX_RESULT_CHARS ? s
+        : s.slice(0, MAX_RESULT_CHARS) +
+          `\n…[truncated ${s.length - MAX_RESULT_CHARS} chars — narrow your \`return\` or lower \`depth\`]`;
+
 interface BridgeReply { id?: string; ok: boolean; result?: unknown; error?: string; }
 
 /* ----------------------------------------------------------- daemon glue -- */
@@ -100,7 +107,7 @@ function text(s: string, isError = false): ToolResult {
 function formatReply(reply: BridgeReply): ToolResult {
     if (reply.ok) {
         const r = reply.result;
-        return text(typeof r === "string" ? r : (JSON.stringify(r, null, 2) ?? "undefined"));
+        return text(cap(typeof r === "string" ? r : (JSON.stringify(r, null, 2) ?? "undefined")));
     }
     return text("Discord renderer error:\n" + (reply.error ?? "unknown error"), true);
 }
@@ -117,15 +124,15 @@ const mcp = new McpServer({ name: "discord-bridge", version: "2.1.0" });
 
 mcp.registerTool("discord_eval", {
     description:
-        "Evaluate JavaScript inside the running Discord (Vencord) renderer and return the " +
-        "result. Runs in global scope with access to `Vencord`, `document`, `window`, etc. " +
-        "`await` is supported. Pass a single expression (e.g. `document.title`) OR several " +
-        "statements with an explicit `return`. Results are cycle-safe and serialized to " +
-        "`depth` levels (default 8); DOM nodes return as { tag, classes, outerHTML }.",
+        "Evaluate JavaScript in the running Discord (Vencord) renderer and return the result. " +
+        "Global scope: `Vencord`, `document`, `window`; `await` works. Pass one expression, or " +
+        "statements with an explicit `return`. Results are cycle-safe, serialized to `depth` " +
+        "levels (default 3); DOM nodes return as { tag, classes, outerHTML }. Token tip: " +
+        "`return` only the fields you need.",
     inputSchema: {
         code: z.string().optional().describe("JavaScript to evaluate. Provide this or `file`."),
         file: z.string().optional().describe("Absolute path to a .js file to evaluate instead of `code`."),
-        depth: z.number().int().min(1).max(20).optional().describe("Result serialization depth (default 8)."),
+        depth: z.number().int().min(1).max(20).optional().describe("Result serialization depth (default 3; raise only for nested data)."),
     },
 }, async ({ code, file, depth }) => {
     let src = code;
@@ -134,28 +141,28 @@ mcp.registerTool("discord_eval", {
         catch (e) { return text("Could not read file: " + errMsg(e), true); }
     }
     if (!src || !src.trim()) return text("Provide `code` or `file`.", true);
-    return runInRenderer(src, depth);
+    return runInRenderer(src, depth ?? 3);
 });
 
 mcp.registerTool("discord_query", {
     description:
-        "Run document.querySelectorAll for a CSS selector in the Discord renderer; returns " +
-        "matched elements as { tag, id, classes, text, outerHTML }. Use it to discover " +
-        "Discord's minified CSS class names for a UI element.",
+        "querySelectorAll a CSS selector in the Discord renderer — returns matched elements " +
+        "as { tag, id, classes, text, outerHTML }. Use it to discover Discord's minified CSS " +
+        "class names for a UI element.",
     inputSchema: {
         selector: z.string().describe(`CSS selector, e.g. [class*="chatContent"].`),
-        limit: z.number().int().min(1).max(50).optional().describe("Max elements to return (default 15)."),
+        limit: z.number().int().min(1).max(50).optional().describe("Max elements to return (default 6)."),
     },
 }, async ({ selector, limit }) => runInRenderer(`(() => {
     const els = [...document.querySelectorAll(${JSON.stringify(selector)})];
     return {
         count: els.length,
-        elements: els.slice(0, ${limit ?? 15}).map(el => ({
+        elements: els.slice(0, ${limit ?? 6}).map(el => ({
             tag: el.tagName.toLowerCase(),
             id: el.id || undefined,
             classes: [...el.classList],
             text: (el.textContent || "").trim().slice(0, 100),
-            outerHTML: el.outerHTML.slice(0, 700),
+            outerHTML: el.outerHTML.slice(0, 160),
         })),
     };
 })()`));
@@ -184,8 +191,8 @@ mcp.registerTool("discord_findModule", {
             let m = null;
             try { m = W.findByProps(...PROPS); } catch (e) {}
             out.props = m ? {
-                keys: Object.keys(m).slice(0, 200),
-                values: Object.fromEntries(Object.entries(m).slice(0, 200)
+                keys: Object.keys(m).slice(0, 60),
+                values: Object.fromEntries(Object.entries(m).slice(0, 60)
                     .map(([k, v]) => [k, typeof v === "string" ? v : typeof v])),
             } : "no module found exporting all of: " + PROPS.join(", ");
         }
@@ -202,9 +209,9 @@ mcp.registerTool("discord_findModule", {
                         hits.push({
                             id,
                             sourceLength: src.length,
-                            snippet: src.slice(Math.max(0, idx - 240), idx + 520),
+                            snippet: src.slice(Math.max(0, idx - 120), idx + 320),
                         });
-                        if (hits.length >= 8) break;
+                        if (hits.length >= 5) break;
                     }
                 }
                 out.code = { matches: hits.length, hits };
@@ -216,11 +223,9 @@ mcp.registerTool("discord_findModule", {
 
 mcp.registerTool("discord_click", {
     description:
-        "Click an element in the Discord renderer (a button, menu item, etc.). Dispatches a " +
-        "full synthetic pointer/mouse/click sequence on the element matching the selector. " +
-        "Good for driving Discord's UI and testing buttons. Note: synthetic events are " +
-        "isTrusted=false — they work for most UI, but Discord ignores them on guarded " +
-        "actions such as sending a message.",
+        "Click an element (button, menu item, etc.) in the Discord renderer — dispatches a " +
+        "synthetic pointer/mouse/click sequence on the selector match. Note: events are " +
+        "isTrusted=false, so Discord ignores them on guarded actions like sending a message.",
     inputSchema: {
         selector: z.string().describe(`CSS selector of the element to click, e.g. button[aria-label="Edit"].`),
         index: z.number().int().min(0).optional().describe("Which match to click when several (default 0)."),
@@ -250,12 +255,10 @@ mcp.registerTool("discord_click", {
 
 mcp.registerTool("discord_key", {
     description:
-        "Dispatch a keyboard event / shortcut in the Discord renderer — e.g. \"Ctrl+K\" " +
-        "(quick switcher), \"Escape\", \"ArrowDown\", \"Ctrl+Shift+M\". Dispatches " +
-        "keydown/keypress/keyup on the target (a CSS selector, or the focused element). " +
-        "Good for testing Discord's keyboard shortcuts. Note: synthetic events are " +
-        "isTrusted=false — they drive most shortcuts, but Discord ignores them on guarded " +
-        "actions such as Enter-to-send in the message box.",
+        "Dispatch a keyboard event/shortcut in the Discord renderer — e.g. \"Ctrl+K\", " +
+        "\"Escape\", \"ArrowDown\". Fires keydown/keypress/keyup on the target (a CSS " +
+        "selector, or the focused element). Note: events are isTrusted=false, so Discord " +
+        "ignores them on guarded actions like Enter-to-send.",
     inputSchema: {
         combo: z.string().describe(`Key or combo, e.g. "Ctrl+K", "Escape", "ArrowDown", "Shift+Tab".`),
         selector: z.string().optional().describe("CSS selector of the target element (default: the focused element)."),
@@ -310,33 +313,36 @@ mcp.registerTool("discord_key", {
 
 mcp.registerTool("discord_console", {
     description:
-        "Return recent console warnings/errors and uncaught exceptions captured from the " +
-        "Discord renderer (oldest first, newest last). Check this after an eval, or after " +
-        "a plugin/Vencord change, to see what was logged.",
+        "Return recent console warnings/errors and uncaught exceptions from the Discord " +
+        "renderer (oldest first). Check after an eval or a plugin/Vencord change.",
     inputSchema: {
-        limit: z.number().int().min(1).max(200).optional().describe("Max entries to return (default 40)."),
+        limit: z.number().int().min(1).max(200).optional().describe("Max entries to return (default 20)."),
     },
 }, async ({ limit }) => runInRenderer(
-    `((globalThis.$discordBridge && globalThis.$discordBridge.console) || []).slice(-${limit ?? 40})`));
+    `((globalThis.$discordBridge && globalThis.$discordBridge.console) || []).slice(-${limit ?? 20})`));
 
 mcp.registerTool("discord_screenshot", {
     description:
-        "Capture a screenshot of the running Discord (Vencord) renderer and return it as an " +
-        "image. Use it to SEE the UI — verify a layout/styling change, inspect a component, " +
-        "or debug a visual bug — instead of guessing from the DOM. Pass `selector` to capture " +
-        "a single element (it is scrolled into view first); omit it for the whole window. " +
-        "Only the currently-visible viewport is captured; scroll or navigate first if needed.",
+        "Screenshot the running Discord (Vencord) renderer as an image — to SEE the UI " +
+        "(verify a layout/styling change, debug a visual bug). Pass `selector` to capture one " +
+        "element (cheaper — fewer tokens — and scrolled into view first); omit for the whole " +
+        "viewport. Only the visible viewport is captured; scroll or navigate first if needed.",
     inputSchema: {
         selector: z.string().optional().describe("CSS selector of one element to capture; omit for the full window."),
-        format: z.enum(["png", "jpeg"]).optional().describe("Image format (default png; jpeg is smaller)."),
-        maxWidth: z.number().int().min(64).max(4096).optional().describe("Scale down so width ≤ this many px (default 1600)."),
-        quality: z.number().int().min(1).max(100).optional().describe("JPEG quality 1–100 (default 85; ignored for png)."),
+        format: z.enum(["png", "jpeg"]).optional().describe("Image format (default jpeg — smaller; png is lossless)."),
+        maxWidth: z.number().int().min(64).max(4096).optional().describe("Scale down so width ≤ this many px (default 1280)."),
+        quality: z.number().int().min(1).max(100).optional().describe("JPEG quality 1–100 (default 70; ignored for png)."),
     },
 }, async ({ selector, format, maxWidth, quality }) => {
     try {
         const res = await daemonFetch("/screenshot", {
             method: "POST",
-            body: JSON.stringify({ selector, format, maxWidth, quality }),
+            body: JSON.stringify({
+                selector,
+                format: format ?? "jpeg",
+                maxWidth: maxWidth ?? 1280,
+                quality: quality ?? 70,
+            }),
         }, 35_000);
         const reply = (await res.json()) as BridgeReply;
         if (!reply.ok)
@@ -359,10 +365,9 @@ mcp.registerTool("discord_screenshot", {
 
 mcp.registerTool("discord_reload", {
     description:
-        "Reload the Discord renderer (equivalent to pressing Ctrl+R) and wait until the " +
-        "bridge reconnects and Vencord/webpack are ready again — all in one call. Use this " +
-        "after deploying a new Vencord plugin build to load it, or to recover a wedged " +
-        "renderer. The bridge daemon is unaffected; only the renderer reloads.",
+        "Reload the Discord renderer (like Ctrl+R) and wait until the bridge reconnects and " +
+        "Vencord/webpack are ready — one call. Use after deploying a Vencord plugin build, " +
+        "or to recover a wedged renderer. The daemon is unaffected; only the renderer reloads.",
     inputSchema: {},
 }, async () => {
     try {
@@ -379,10 +384,9 @@ mcp.registerTool("discord_reload", {
 
 mcp.registerTool("discord_wait", {
     description:
-        "Wait until a condition becomes true in the Discord renderer — either a CSS " +
-        "`selector` appears in the DOM, or a JS boolean `expr` evaluates truthy. Polls " +
-        "until satisfied or `timeoutMs` elapses. Use it to synchronize after navigation, " +
-        "a click, or a reload before the next step.",
+        "Wait until a condition holds in the Discord renderer — a CSS `selector` appears in " +
+        "the DOM, or a JS boolean `expr` is truthy. Polls until satisfied or `timeoutMs` " +
+        "elapses. Use to synchronize after navigation, a click, or a reload.",
     inputSchema: {
         selector: z.string().optional().describe("CSS selector to wait for (≥1 element matches)."),
         expr: z.string().optional().describe("JS boolean expression to wait for, e.g. `!!window.Vencord`."),
