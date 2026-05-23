@@ -825,6 +825,494 @@ function bridgeListDMs(args: ListDMsArgs = {}): unknown {
     };
 }
 
+/* --------------------------------------------- history / search / stats -- */
+
+const DISCORD_EPOCH = 1420070400000n;
+
+function snowflakeToIso(snowflake: string): string | null {
+    try { return new Date(Number((BigInt(snowflake) >> 22n) + DISCORD_EPOCH)).toISOString(); }
+    catch { return null; }
+}
+
+/** ISO timestamp (or Date-parseable string) → Discord snowflake bound. */
+function isoToSnowflake(iso: string): string | null {
+    const ms = Date.parse(iso);
+    if (!Number.isFinite(ms)) return null;
+    return (((BigInt(ms) - DISCORD_EPOCH) << 22n)).toString();
+}
+
+/** Pull the live user auth token from Discord's webpack stores. */
+function getAuthToken(W: any): string {
+    const m = W.findByProps?.("getToken") || W.findByProps?.("getCachedToken");
+    const tok = m?.getToken?.() || m?.getCachedToken?.();
+    if (!tok) throw new Error("Auth token unavailable from webpack — not logged in, or token store moved.");
+    return tok;
+}
+
+/** Raw REST message → caller-facing projection driven by `select`. `id` always present. */
+function projectMessage(msg: any, select: Set<string>): any {
+    const out: any = { id: msg.id };
+    if (select.has("content")) out.content = msg.content || "";
+    if (select.has("timestamp")) out.timestamp = msg.timestamp || snowflakeToIso(msg.id);
+    if (select.has("author") && msg.author) out.author = {
+        id: msg.author.id,
+        username: msg.author.username,
+        name: msg.author.global_name ?? msg.author.globalName ?? msg.author.username,
+        bot: !!msg.author.bot,
+    };
+    if (select.has("attachments") && msg.attachments?.length) {
+        out.attachments = msg.attachments.map((a: any) => ({
+            name: a.filename || a.name,
+            url: a.url,
+            size: a.size,
+            contentType: a.content_type || a.contentType,
+            width: a.width, height: a.height,
+        }));
+    }
+    if (select.has("replyTo") && msg.message_reference?.message_id) {
+        out.replyTo = {
+            id: msg.message_reference.message_id,
+            channelId: msg.message_reference.channel_id,
+        };
+    }
+    if (select.has("mentions") && msg.mentions?.length) {
+        out.mentions = msg.mentions.map((u: any) => ({
+            id: u.id, name: u.global_name ?? u.globalName ?? u.username,
+        }));
+    }
+    if (select.has("reactions") && msg.reactions?.length) {
+        out.reactions = msg.reactions.map((r: any) => ({
+            emoji: r.emoji?.name || r.emoji?.id || String(r.emoji),
+            count: r.count, me: !!r.me,
+        }));
+    }
+    if (select.has("edited") && msg.edited_timestamp) out.edited = msg.edited_timestamp;
+    return out;
+}
+
+/** GET /channels/{id}/messages with retry on 429. Returns raw Discord array. */
+async function restFetchMessages(channelId: string, params: Record<string, string | number>, token: string): Promise<any[]> {
+    const u = new URL(`https://discord.com/api/v9/channels/${channelId}/messages`);
+    for (const [k, v] of Object.entries(params)) if (v != null) u.searchParams.set(k, String(v));
+    const r = await fetch(u.toString(), { headers: { authorization: token } });
+    if (r.status === 429) {
+        const j = await r.json().catch(() => ({} as any));
+        const wait = Math.min(10_000, Math.max(250, (j.retry_after || 1) * 1000));
+        await sleep(wait);
+        return restFetchMessages(channelId, params, token);
+    }
+    if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        throw new Error(`Discord REST /messages error ${r.status}: ${body.slice(0, 300)}`);
+    }
+    return r.json();
+}
+
+interface GetHistoryArgs {
+    channelId?: string;
+    before?: string;
+    after?: string;
+    around?: string;
+    since?: string;
+    until?: string;
+    from?: string;
+    contains?: string;
+    limit?: number;
+    select?: string[];
+}
+
+/**
+ * Paginated channel history via Discord REST. Walks newest→oldest in 100-msg
+ * batches, applying client-side filters (`from`, `contains`, `since`/`until`)
+ * since the REST endpoint doesn't natively support them. Returns oldest-first
+ * so the agent can read it like a transcript, plus a `nextBefore` cursor for
+ * deeper paging.
+ *
+ * `select` is field projection — defaults to the cheap set. Use it.
+ */
+async function bridgeGetHistory(args: GetHistoryArgs = {}): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+
+    const channelId = args.channelId || SelectedChannelStore?.getChannelId?.();
+    if (!channelId) throw new Error("No channel selected and no channelId provided.");
+    const channel = ChannelStore?.getChannel?.(channelId);
+
+    const token = getAuthToken(W);
+    const selectKeys = new Set<string>(
+        args.select?.length ? args.select : ["id", "content", "author", "timestamp"]
+    );
+    const limit = Math.max(1, Math.min(5000, args.limit ?? 200));
+
+    // ISO → snowflake fallback for since/until when explicit before/after not set.
+    let before = args.before || (args.until ? isoToSnowflake(args.until) : null) || undefined;
+    const after = args.after || (args.since ? isoToSnowflake(args.since) : null) || undefined;
+
+    const fromId = args.from || null;
+    const containsLo = args.contains ? args.contains.toLowerCase() : null;
+    const lowerBound = after ? BigInt(after) : null;
+
+    const out: any[] = [];
+    let cursor: string | undefined = before;
+    let reachedEnd = false;
+    let pages = 0;
+
+    // Single-call `around` mode — Discord returns 50 each side; ignore paging.
+    if (args.around && !cursor) {
+        const batch = await restFetchMessages(channelId, { limit: 100, around: args.around }, token);
+        for (const m of batch) {
+            if (fromId && m.author?.id !== fromId) continue;
+            if (containsLo && !(m.content || "").toLowerCase().includes(containsLo)) continue;
+            out.push(projectMessage(m, selectKeys));
+        }
+        reachedEnd = true;
+    } else {
+        while (out.length < limit) {
+            const params: Record<string, string | number> = { limit: 100 };
+            if (cursor) params.before = cursor;
+            const batch = await restFetchMessages(channelId, params, token);
+            pages++;
+            if (!batch.length) { reachedEnd = true; break; }
+
+            let stop = false;
+            for (const m of batch) {
+                if (lowerBound && BigInt(m.id) <= lowerBound) { stop = true; continue; }
+                if (fromId && m.author?.id !== fromId) continue;
+                if (containsLo && !(m.content || "").toLowerCase().includes(containsLo)) continue;
+                out.push(projectMessage(m, selectKeys));
+                if (out.length >= limit) break;
+            }
+            cursor = batch[batch.length - 1].id;
+            if (batch.length < 100) { reachedEnd = true; break; }
+            if (stop) { reachedEnd = true; break; }
+        }
+    }
+
+    // Currently newest-first → flip to oldest-first.
+    out.reverse();
+
+    return {
+        channel: channel ? {
+            id: channel.id,
+            name: channel.name || (channel.recipients?.length ? "(DM)" : null),
+            type: channel.type,
+            guildId: channel.guild_id || null,
+        } : { id: channelId },
+        count: out.length,
+        pagesFetched: pages,
+        hasMoreBefore: !reachedEnd,
+        nextBefore: !reachedEnd ? cursor || null : null,
+        oldestId: out[0]?.id || null,
+        newestId: out[out.length - 1]?.id || null,
+        messages: out,
+    };
+}
+
+interface SearchArgs {
+    channelId?: string;
+    query: string;
+    from?: string;
+    mentions?: string;
+    has?: string[];
+    before?: string;
+    after?: string;
+    limit?: number;
+}
+
+/**
+ * Wraps Discord's `/messages/search` endpoint. Uses the guild-level URL for
+ * guild channels (with `channel_id=` constraint), channel-level for DMs/groups.
+ * Auto-loops `offset` pagination up to `limit`. Surfaces indexing/rate-limit
+ * responses so the caller can decide what to do.
+ */
+async function bridgeSearchMessages(args: SearchArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+    if (!args.query || !args.query.trim()) throw new Error("`query` is required.");
+
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+
+    const channelId = args.channelId || SelectedChannelStore?.getChannelId?.();
+    if (!channelId) throw new Error("No channel selected and no channelId provided.");
+    const channel = ChannelStore?.getChannel?.(channelId);
+    const token = getAuthToken(W);
+    const limit = Math.max(1, Math.min(200, args.limit ?? 25));
+
+    const base = channel?.guild_id
+        ? `https://discord.com/api/v9/guilds/${channel.guild_id}/messages/search`
+        : `https://discord.com/api/v9/channels/${channelId}/messages/search`;
+
+    const baseParams = new URLSearchParams();
+    baseParams.set("content", args.query);
+    if (channel?.guild_id) baseParams.set("channel_id", channelId);
+    if (args.from) baseParams.set("author_id", args.from);
+    if (args.mentions) baseParams.set("mentions", args.mentions);
+    for (const h of args.has || []) baseParams.append("has", h);
+    if (args.before) baseParams.set("max_id", args.before);
+    if (args.after) baseParams.set("min_id", args.after);
+
+    const collected: any[] = [];
+    let totalResults = 0;
+    let offset = 0;
+    const selectKeys = new Set(["id", "content", "author", "timestamp", "attachments"]);
+
+    while (collected.length < limit) {
+        const p = new URLSearchParams(baseParams);
+        p.set("offset", String(offset));
+        const r = await fetch(`${base}?${p.toString()}`, { headers: { authorization: token } });
+
+        if (r.status === 202) {
+            const j = await r.json().catch(() => ({} as any));
+            return {
+                indexing: true,
+                retryAfter: j.retry_after || null,
+                message: "Discord is indexing this channel for search. Retry after `retryAfter` seconds.",
+            };
+        }
+        if (r.status === 429) {
+            const j = await r.json().catch(() => ({} as any));
+            await sleep(Math.min(10_000, Math.max(250, (j.retry_after || 1) * 1000)));
+            continue;
+        }
+        if (!r.ok) {
+            const body = await r.text().catch(() => "");
+            throw new Error(`Discord search error ${r.status}: ${body.slice(0, 300)}`);
+        }
+
+        const j: any = await r.json();
+        totalResults = j.total_results ?? totalResults;
+        if (!j.messages?.length) break;
+
+        for (const group of j.messages) {
+            const hit = group.find?.((m: any) => m.hit) || group[Math.floor(group.length / 2)] || group[0];
+            if (!hit) continue;
+            collected.push({ ...projectMessage(hit, selectKeys), hit: true });
+            if (collected.length >= limit) break;
+        }
+
+        offset += j.messages.length;
+        if (j.messages.length < 25) break;     // Discord page size — last page
+    }
+
+    return {
+        channel: channel ? {
+            id: channel.id,
+            name: channel.name || (channel.recipients?.length ? "(DM)" : null),
+            guildId: channel.guild_id || null,
+        } : { id: channelId },
+        query: args.query,
+        totalResults,
+        count: collected.length,
+        messages: collected,
+    };
+}
+
+/**
+ * Strip-words list — PT + EN chat noise. Stored accent-stripped + lowercase;
+ * words from messages are normalized the same way before lookup, so casual PT
+ * typing ("nao", "voce", "ja") matches the canonical form ("não", "você", "já").
+ */
+const RAW_STOPWORDS = [
+    // EN
+    "the", "and", "for", "are", "but", "not", "you", "your", "yours", "with", "this", "that", "from", "have",
+    "has", "had", "was", "were", "will", "would", "could", "should", "can", "may", "might", "just", "like",
+    "what", "when", "where", "why", "how", "who", "which", "than", "then", "into", "over", "about", "out",
+    "all", "any", "some", "one", "two", "get", "got", "going", "yeah", "yes", "ok", "okay", "lol", "haha",
+    "really", "very", "much", "only", "also", "even", "still", "now", "here", "there", "their", "them",
+    "they", "his", "her", "him", "she", "its", "our", "ours", "mine", "myself", "yourself",
+    "been", "being", "does", "did", "doing", "done", "say", "said", "says", "see", "seen", "know", "knew",
+    // PT
+    "que", "para", "com", "como", "uma", "uns", "umas", "dos", "das", "nas", "nos", "por", "pelo", "pela",
+    "pelos", "pelas", "sem", "mais", "menos", "muito", "muita", "muitos", "muitas", "tão", "também", "ainda",
+    "agora", "depois", "antes", "sempre", "nunca", "aqui", "ali", "lá", "cá", "isto", "isso", "aquilo",
+    "este", "esta", "esse", "essa", "aquele", "aquela", "estes", "estas", "esses", "essas", "aqueles", "aquelas",
+    "meu", "minha", "meus", "minhas", "teu", "tua", "seu", "sua", "seus", "suas",
+    "nosso", "nossa", "nossos", "nossas", "dele", "dela", "deles", "delas",
+    "ser", "ter", "estar", "estou", "está", "estão", "estava", "estavam", "foi", "fui", "foram", "fosse",
+    "são", "ele", "ela", "eles", "elas", "você", "vocês", "nós", "vós", "eu", "tu",
+    "não", "sim", "então", "porque", "porquê", "pra", "pro", "tá", "tô", "né", "aí",
+    "mas", "ou", "se", "já", "só", "vai", "vão", "vou", "vamos", "vem", "veio", "ver",
+    "fazer", "feito", "faz", "fez", "ter", "tem", "tinha", "teve", "tive", "havia",
+    "até", "onde", "qual", "quem", "quando",
+];
+
+const stripAccents = (s: string) => s.normalize("NFD").replace(/[̀-ͯ]/g, "");
+const STOPWORDS = new Set<string>(RAW_STOPWORDS.map(w => stripAccents(w.toLowerCase())));
+
+const URL_RE = /https?:\/\/([^\s/]+)/gi;
+const WORD_RE = /[a-zA-ZÀ-ſ]{3,}/g;
+
+interface StatsArgs {
+    channelId?: string;
+    since?: string;
+    until?: string;
+    groupBy?: "day" | "week" | "month";
+    topN?: number;
+    hardCap?: number;
+}
+
+function bucketOf(iso: string, groupBy: string): string {
+    const d = new Date(iso);
+    if (groupBy === "day") return d.toISOString().slice(0, 10);
+    if (groupBy === "week") {
+        const jan1 = Date.UTC(d.getUTCFullYear(), 0, 1);
+        const dayOfYear = Math.floor((d.getTime() - jan1) / 86_400_000) + 1;
+        const week = Math.ceil(dayOfYear / 7);
+        return `${d.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+    }
+    return d.toISOString().slice(0, 7);            // month default
+}
+
+/**
+ * Aggregate stats over a channel + time window. Same REST paging loop as
+ * `bridgeGetHistory`, but the output is fixed-size (aggregates) regardless of
+ * how many messages were scanned — safe for very large windows.
+ *
+ * `hardCap` (default 50000) bounds how many messages get scanned, in case the
+ * window is wider than expected.
+ */
+async function bridgeGetStats(args: StatsArgs = {}): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+    const MessageStore = W.findByProps("getMessage", "getMessages");
+
+    const channelId = args.channelId || SelectedChannelStore?.getChannelId?.();
+    if (!channelId) throw new Error("No channel selected and no channelId provided.");
+    const channel = ChannelStore?.getChannel?.(channelId);
+
+    const token = getAuthToken(W);
+    const since = args.since ? isoToSnowflake(args.since) : null;
+    const until = args.until ? isoToSnowflake(args.until) : null;
+    const groupBy = args.groupBy || "month";
+    const topN = Math.max(1, Math.min(100, args.topN ?? 10));
+    const hardCap = Math.max(100, Math.min(200_000, args.hardCap ?? 50_000));
+
+    // Page newest→oldest until we cross `since` or hit hardCap.
+    const lower = since ? BigInt(since) : null;
+    let cursor: string | undefined = until || undefined;
+    let scanned = 0;
+    let reachedEnd = false;
+    let pages = 0;
+
+    let attachments = 0, links = 0, replies = 0;
+    const authorCount = new Map<string, number>();
+    const authorName = new Map<string, string>();
+    const bucketCount = new Map<string, number>();
+    const replyEdges = new Map<string, number>();
+    const domains = new Map<string, number>();
+    const words = new Map<string, number>();
+    let firstTs: string | null = null, lastTs: string | null = null;
+
+    while (scanned < hardCap) {
+        const params: Record<string, string | number> = { limit: 100 };
+        if (cursor) params.before = cursor;
+        const batch = await restFetchMessages(channelId, params, token);
+        pages++;
+        if (!batch.length) { reachedEnd = true; break; }
+
+        let stop = false;
+        for (const m of batch) {
+            if (lower && BigInt(m.id) <= lower) { stop = true; break; }
+            scanned++;
+            const aid = m.author?.id;
+            if (aid) {
+                authorCount.set(aid, (authorCount.get(aid) || 0) + 1);
+                if (!authorName.has(aid)) {
+                    authorName.set(aid, m.author.global_name ?? m.author.globalName ?? m.author.username);
+                }
+            }
+            const ts = m.timestamp || snowflakeToIso(m.id);
+            if (ts) {
+                if (!firstTs || ts < firstTs) firstTs = ts;
+                if (!lastTs || ts > lastTs) lastTs = ts;
+                bucketCount.set(bucketOf(ts, groupBy), (bucketCount.get(bucketOf(ts, groupBy)) || 0) + 1);
+            }
+            if (m.attachments?.length) attachments += m.attachments.length;
+            if (m.message_reference?.message_id) {
+                replies++;
+                const refChan = m.message_reference.channel_id || channelId;
+                const stored = MessageStore?.getMessage?.(refChan, m.message_reference.message_id);
+                const toId = stored?.author?.id;
+                if (aid && toId) {
+                    const key = `${aid}→${toId}`;
+                    replyEdges.set(key, (replyEdges.get(key) || 0) + 1);
+                }
+            }
+            const content = m.content || "";
+            const urlMatches = content.match(URL_RE) || [];
+            for (const u of urlMatches) {
+                links++;
+                const dm = u.match(/https?:\/\/([^\s/]+)/i);
+                if (dm) {
+                    const host = dm[1].replace(/^www\./, "").toLowerCase();
+                    domains.set(host, (domains.get(host) || 0) + 1);
+                }
+            }
+            const wmatches = content.toLowerCase().match(WORD_RE) || [];
+            for (const w of wmatches) {
+                const norm = stripAccents(w);
+                if (STOPWORDS.has(norm)) continue;
+                words.set(norm, (words.get(norm) || 0) + 1);
+            }
+        }
+        cursor = batch[batch.length - 1].id;
+        if (stop) { reachedEnd = true; break; }
+        if (batch.length < 100) { reachedEnd = true; break; }
+    }
+
+    const total = scanned;
+    const rank = <T extends string>(m: Map<T, number>, n: number) =>
+        [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n);
+
+    return {
+        channel: channel ? {
+            id: channel.id,
+            name: channel.name || (channel.recipients?.length ? "(DM)" : null),
+            type: channel.type,
+            guildId: channel.guild_id || null,
+        } : { id: channelId },
+        summary: {
+            total,
+            attachments,
+            links,
+            replies,
+            distinctAuthors: authorCount.size,
+            span: { firstTs, lastTs },
+            windowSince: args.since || null,
+            windowUntil: args.until || null,
+            pagesFetched: pages,
+            scanComplete: reachedEnd,
+            hardCapHit: scanned >= hardCap,
+        },
+        byAuthor: rank(authorCount, topN).map(([id, count]) => ({
+            id,
+            name: authorName.get(id) || null,
+            count,
+            pct: total ? +(count / total * 100).toFixed(1) : 0,
+        })),
+        byBucket: [...bucketCount.entries()]
+            .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+            .map(([bucket, count]) => ({ bucket, count })),
+        replyEdges: rank(replyEdges, topN).map(([key, count]) => {
+            const [from, to] = key.split("→");
+            return {
+                from, fromName: authorName.get(from) || null,
+                to, toName: authorName.get(to) || null,
+                count,
+            };
+        }),
+        topDomains: rank(domains, topN).map(([domain, count]) => ({ domain, count })),
+        topWords: rank(words, topN).map(([word, count]) => ({ word, count })),
+    };
+}
+
 /* ----------------------------------------------------- open a channel ---- */
 
 interface OpenChannelArgs {
@@ -994,7 +1482,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 15,
+            version: 16,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
@@ -1002,6 +1490,9 @@ export default definePlugin({
             getView: bridgeGetView,
             listDMs: bridgeListDMs,
             openChannel: bridgeOpenChannel,
+            getHistory: bridgeGetHistory,
+            searchMessages: bridgeSearchMessages,
+            getStats: bridgeGetStats,
         };
         // Resume whatever state the toolbar icon was left in last session.
         if (settings.store.bridgeActive) startPolling();

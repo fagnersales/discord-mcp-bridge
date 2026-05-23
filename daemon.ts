@@ -227,13 +227,18 @@ async function handleHttp(req: Request): Promise<Response> {
         return jsonCors(await reloadAndWait());
     }
 
-    // eval raw JS in the renderer; ?depth=N controls result serialization depth
+    // eval raw JS in the renderer; ?depth=N controls result serialization depth,
+    // ?timeoutMs=N overrides the default 12s wait (clamped to [1s, 300s]).
     if (req.method === "POST" && url.pathname === "/eval") {
         const code = await req.text();
         if (!code.trim()) return jsonCors({ ok: false, error: "empty body" }, 400);
         const depthRaw = parseInt(url.searchParams.get("depth") ?? "", 10);
         const depth = Number.isFinite(depthRaw) ? Math.max(1, Math.min(20, depthRaw)) : DEFAULT_DEPTH;
-        try { return jsonCors(await bridgeEval(code, depth)); }
+        const toRaw = parseInt(url.searchParams.get("timeoutMs") ?? "", 10);
+        const timeoutMs = Number.isFinite(toRaw)
+            ? Math.max(1_000, Math.min(300_000, toRaw))
+            : CALL_TIMEOUT_MS;
+        try { return jsonCors(await bridgeEval(code, depth, timeoutMs)); }
         catch (e) { return jsonCors({ ok: false, error: errMsg(e) }, 502); }
     }
 

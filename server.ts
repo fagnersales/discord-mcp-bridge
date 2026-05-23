@@ -32,7 +32,7 @@ const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 /** Hard cap on a single tool result — stops a runaway eval from nuking the context window. */
-const MAX_RESULT_CHARS = 16_000;
+const MAX_RESULT_CHARS = 80_000;
 const cap = (s: string) =>
     s.length <= MAX_RESULT_CHARS ? s
         : s.slice(0, MAX_RESULT_CHARS) +
@@ -89,8 +89,14 @@ async function daemonFetch(path: string, init: RequestInit, timeoutMs: number): 
 }
 
 async function daemonEval(code: string, depth?: number, timeoutMs = 20_000): Promise<BridgeReply> {
-    const path = depth ? `/eval?depth=${depth}` : "/eval";
-    const res = await daemonFetch(path, { method: "POST", body: code }, timeoutMs);
+    const qs = new URLSearchParams();
+    if (depth) qs.set("depth", String(depth));
+    qs.set("timeoutMs", String(timeoutMs));
+    const path = `/eval?${qs.toString()}`;
+    // HTTP timeout slightly longer than the eval budget so the daemon's own
+    // timer fires first and we get a clean "bridge call timed out" error
+    // instead of an AbortError from fetch.
+    const res = await daemonFetch(path, { method: "POST", body: code }, timeoutMs + 5_000);
     return (await res.json()) as BridgeReply;
 }
 
@@ -113,15 +119,15 @@ function formatReply(reply: BridgeReply): ToolResult {
     return text("Discord renderer error:\n" + (reply.error ?? "unknown error"), true);
 }
 
-async function runInRenderer(code: string, depth?: number): Promise<ToolResult> {
+async function runInRenderer(code: string, depth?: number, timeoutMs?: number): Promise<ToolResult> {
     try {
-        return formatReply(await daemonEval(code, depth));
+        return formatReply(await daemonEval(code, depth, timeoutMs));
     } catch (e) {
         return text("Bridge error: " + errMsg(e), true);
     }
 }
 
-const mcp = new McpServer({ name: "discord-bridge", version: "2.6.0" });
+const mcp = new McpServer({ name: "discord-bridge", version: "2.7.0" });
 
 mcp.registerTool("discord_eval", {
     description:
@@ -491,6 +497,95 @@ mcp.registerTool("discord_send", {
     } catch (e) {
         return text("Bridge error: " + errMsg(e), true);
     }
+});
+
+mcp.registerTool("discord_history", {
+    description:
+        "Fetch a paginated slice of channel history via Discord REST — the primitive for " +
+        "\"give me the last N messages\" or \"every message between X and Y\". Unlike " +
+        "`discord_view` (which is bounded to the user's current viewport), this walks the " +
+        "real backlog and works for any channelId. Pages internally in 100-message chunks " +
+        "and returns oldest-first so the result reads like a transcript. " +
+        "Bound the window with `before`/`after` snowflakes, or `since`/`until` ISO " +
+        "timestamps (auto-converted to snowflakes). `from`/`contains` are client-side " +
+        "filters applied after the fetch. Always pass a tight `select` projection — the " +
+        "default ([id, content, author, timestamp]) is what you usually want; only widen it " +
+        "when you actually need attachments / replyTo / mentions / reactions. " +
+        "If `hasMoreBefore` is true, pass `nextBefore` back as `before` to keep paging deeper.",
+    inputSchema: {
+        channelId: z.string().optional().describe("Target channel ID. Omit to use the currently selected channel."),
+        before: z.string().optional().describe("Snowflake — return messages strictly older than this ID."),
+        after: z.string().optional().describe("Snowflake — return messages strictly newer than this ID."),
+        around: z.string().optional().describe("Snowflake — return messages around this ID (single 100-msg window; ignores `limit`)."),
+        since: z.string().optional().describe("ISO timestamp lower bound (auto-converted to a snowflake). Ignored if `after` is set."),
+        until: z.string().optional().describe("ISO timestamp upper bound (auto-converted to a snowflake). Ignored if `before` is set."),
+        from: z.string().optional().describe("Filter to messages from this user ID (client-side; Discord REST has no author filter)."),
+        contains: z.string().optional().describe("Filter to messages whose content includes this substring, case-insensitive."),
+        limit: z.number().int().min(1).max(5000).optional().describe("Max messages to return (default 200, max 5000). Pages internally; raise only when you really need it."),
+        select: z.array(z.enum(["id", "content", "author", "timestamp", "attachments", "replyTo", "mentions", "reactions", "edited"])).optional().describe("Field projection. Default: [id, content, author, timestamp]. `id` is always included. Keep this tight — token usage scales linearly."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.getHistory)` +
+        `  ? globalThis.$discordBridge.getHistory(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge getHistory helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 6, 120_000);
+});
+
+mcp.registerTool("discord_search", {
+    description:
+        "Search messages via Discord's native `/messages/search` endpoint — the right tool " +
+        "for \"find every message about X\" or \"what did Alice say about Y\". Works on DMs, " +
+        "group DMs, and guild channels (uses the guild-level search URL automatically when " +
+        "applicable). Loops `offset` pagination internally up to `limit`. " +
+        "Returns `{ totalResults, count, messages }` — each result has `hit: true` and the " +
+        "standard projected fields. If Discord is still indexing the channel, the result is " +
+        "`{ indexing: true, retryAfter }` — wait that many seconds and try again. " +
+        "Prefer this over `discord_history` + client-side `contains` when you have a real " +
+        "keyword query (search hits are server-side ranked and span much further back).",
+    inputSchema: {
+        query: z.string().describe("Search query — words/phrases. Same syntax Discord's search bar uses."),
+        channelId: z.string().optional().describe("Target channel ID. Omit to use the currently selected channel."),
+        from: z.string().optional().describe("Restrict to messages by this user ID (`author_id`)."),
+        mentions: z.string().optional().describe("Restrict to messages mentioning this user ID."),
+        has: z.array(z.enum(["image", "video", "link", "file", "embed", "sound", "sticker"])).optional().describe("Restrict to messages containing these attachment kinds (Discord's `has=` filter)."),
+        before: z.string().optional().describe("Snowflake max bound (`max_id`)."),
+        after: z.string().optional().describe("Snowflake min bound (`min_id`)."),
+        limit: z.number().int().min(1).max(200).optional().describe("Max results to return (default 25, max 200; Discord pages 25 at a time)."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.searchMessages)` +
+        `  ? globalThis.$discordBridge.searchMessages(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge searchMessages helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 6, 60_000);
+});
+
+mcp.registerTool("discord_stats", {
+    description:
+        "Compute aggregate stats over a channel + time window — the right tool for \"who " +
+        "posts most\", \"how active was this DM each month\", \"what links/words come up\". " +
+        "Walks the channel via REST in 100-msg batches (bounded by `hardCap`, default 50k) " +
+        "and emits a fixed-size summary regardless of how many messages were scanned. " +
+        "Output includes: `summary` (total/attachments/links/replies/distinctAuthors/span), " +
+        "`byAuthor` ranked top-N, `byBucket` time series, `replyEdges` top reply graph, " +
+        "`topDomains` from links, `topWords` (PT + EN stopwords stripped). " +
+        "Stopword list is built-in — don't ask for filtering. Use `since`/`until` to bound " +
+        "the window; without them, the entire channel is scanned up to `hardCap`.",
+    inputSchema: {
+        channelId: z.string().optional().describe("Target channel ID. Omit to use the currently selected channel."),
+        since: z.string().optional().describe("ISO timestamp lower bound. Omit to scan back to channel start (capped by `hardCap`)."),
+        until: z.string().optional().describe("ISO timestamp upper bound. Omit to scan from the latest message."),
+        groupBy: z.enum(["day", "week", "month"]).optional().describe("Time bucket granularity for `byBucket` (default `month`)."),
+        topN: z.number().int().min(1).max(100).optional().describe("Cap on each ranked list (byAuthor / replyEdges / topDomains / topWords). Default 10."),
+        hardCap: z.number().int().min(100).max(200_000).optional().describe("Max messages to scan (default 50000). Tighten for fast channels; raise only for full-channel runs."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.getStats)` +
+        `  ? globalThis.$discordBridge.getStats(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge getStats helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 6, 180_000);
 });
 
 mcp.registerTool("discord_reload", {
