@@ -711,6 +711,30 @@ async function bridgeGetView(args: GetViewArgs = {}): Promise<unknown> {
         }
     }
 
+    // Participants: presence + typing for the people actually in this channel.
+    // For DMs/groups use channel.recipients; for guild channels we don't have a
+    // member list cheaply, so fall back to recent message authors in `messages`.
+    const PresenceStore = W.findByProps("getStatus", "getActivities")
+        ?? W.findByProps("getStatus", "isMobileOnline");
+    const TypingStore = W.findByProps("getTypingUsers", "isTyping");
+    const recipientIds: string[] = channel.recipients || channel.recipientIds || [];
+    const participantIds = new Set<string>(recipientIds);
+    if (!participantIds.size) {
+        for (const m of messages) if (m.author?.id) participantIds.add(m.author.id);
+    }
+    if (viewer?.id) participantIds.add(viewer.id);
+    const typingMap = TypingStore?.getTypingUsers?.(channelId) || {};
+    const typingSet = new Set<string>(Array.isArray(typingMap) ? typingMap : Object.keys(typingMap));
+    const participants = [...participantIds].map(uid => {
+        const u = UserStore?.getUser?.(uid);
+        return {
+            userId: uid,
+            name: renderName(u) || null,
+            presence: PresenceStore?.getStatus?.(uid) || "offline",
+            typing: typingSet.has(uid),
+        };
+    });
+
     return {
         channel: {
             id: channel.id,
@@ -727,6 +751,7 @@ async function bridgeGetView(args: GetViewArgs = {}): Promise<unknown> {
             name: renderName(viewer),
         } : null,
         scroll: scrollInfo,
+        participants,
         renderedCount: messages.length,
         unresolved,
         messages,
@@ -1793,6 +1818,359 @@ async function bridgeMember(args: MemberArgs): Promise<unknown> {
     };
 }
 
+/* ------------------------------------------------------- unread / ack --- */
+
+interface UnreadArgs {
+    includeGuilds?: boolean;
+    mentionsOnly?: boolean;
+    limit?: number;
+}
+
+/**
+ * Enumerate channels with unread messages. Walks DMs (always) and guild text
+ * channels (when `includeGuilds`). For each, asks ReadStateStore for unread
+ * count + mention count + oldest unread id.
+ */
+function bridgeUnread(args: UnreadArgs = {}): unknown {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const ReadStateStore = W.findByProps("getUnreadCount", "getMentionCount")
+        ?? W.findByProps("hasUnread", "getUnreadCount");
+    const SortStore = W.findByProps("getPrivateChannelIds")
+        ?? W.findByProps("getSortedPrivateChannels");
+    const GuildStore = W.findByProps("getGuild", "getGuilds");
+    const GuildChannelStore = W.findByProps("getChannels", "getDefaultChannel")
+        ?? W.findByProps("getChannels");
+    const UserStore = W.findByProps("getCurrentUser", "getUser");
+    const RelationshipStore = W.findByProps("getRelationshipType", "isFriend");
+
+    if (!ReadStateStore) throw new Error("ReadStateStore not found.");
+
+    const renderName = (u: any) => u?.globalName ?? u?.global_name ?? u?.username ?? null;
+    const limit = Math.max(1, Math.min(500, args.limit ?? 100));
+    const mentionsOnly = !!args.mentionsOnly;
+
+    const channelIds: string[] = [];
+    if (typeof SortStore?.getPrivateChannelIds === "function") {
+        channelIds.push(...SortStore.getPrivateChannelIds());
+    } else if (typeof ChannelStore?.getSortedPrivateChannels === "function") {
+        channelIds.push(...ChannelStore.getSortedPrivateChannels().map((c: any) => c.id));
+    }
+
+    if (args.includeGuilds && GuildStore && GuildChannelStore?.getChannels) {
+        for (const gid of Object.keys(GuildStore.getGuilds() || {})) {
+            const groups = GuildChannelStore.getChannels(gid);
+            const selectable = groups?.SELECTABLE || groups?.selectable || [];
+            for (const entry of selectable) {
+                const ch = entry.channel || entry;
+                if (ch?.id) channelIds.push(ch.id);
+            }
+        }
+    }
+
+    const out: any[] = [];
+    let totalUnread = 0;
+    let totalMentions = 0;
+    for (const cid of channelIds) {
+        const mentions = ReadStateStore.getMentionCount?.(cid) || 0;
+        const unread = ReadStateStore.getUnreadCount?.(cid) || 0;
+        const has = ReadStateStore.hasUnread?.(cid);
+        if (!unread && !mentions && !has) continue;
+        if (mentionsOnly && !mentions) continue;
+        totalUnread += unread;
+        totalMentions += mentions;
+        const ch = ChannelStore?.getChannel?.(cid);
+        const oldest = ReadStateStore.getOldestUnreadMessageId?.(cid) || null;
+        const lastRead = ReadStateStore.lastMessageId?.(cid) || null;
+        const isDm = ch && (ch.type === 1 || ch.type === 3);
+        let name = ch?.name || null;
+        if (isDm) {
+            const recipientIds: string[] = ch.recipients || ch.recipientIds || [];
+            const first = recipientIds[0];
+            const u = first ? UserStore?.getUser?.(first) : null;
+            const nick = first ? RelationshipStore?.getNickname?.(first) : null;
+            if (ch.type === 1) name = nick || renderName(u) || "(dm)";
+            else name = ch.name || (recipientIds.map(id => {
+                const cu = UserStore?.getUser?.(id);
+                return RelationshipStore?.getNickname?.(id) || renderName(cu);
+            }).filter(Boolean).join(", ") || "(group)");
+        }
+        out.push({
+            channelId: cid,
+            kind: ch?.type === 1 ? "dm" : ch?.type === 3 ? "group" : "guild",
+            name,
+            guildId: ch?.guild_id || null,
+            guildName: ch?.guild_id ? GuildStore?.getGuild?.(ch.guild_id)?.name ?? null : null,
+            unreadCount: unread,
+            mentionCount: mentions,
+            oldestUnreadId: oldest,
+            lastReadMessageId: lastRead,
+        });
+    }
+
+    out.sort((a, b) => (b.mentionCount - a.mentionCount) || (b.unreadCount - a.unreadCount));
+    return {
+        channelsScanned: channelIds.length,
+        totalUnread,
+        totalMentions,
+        count: out.length,
+        channels: out.slice(0, limit),
+    };
+}
+
+interface AckArgs {
+    channelId: string;
+    messageId?: string;
+}
+
+/**
+ * Mark a channel read up to a given message. REST:
+ * `POST /channels/{id}/messages/{messageId}/ack` with `{ token: null, manual: true }`.
+ * If `messageId` omitted, acks the channel's most recent message.
+ */
+async function bridgeAck(args: AckArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+    if (!args.channelId) throw new Error("`channelId` is required.");
+
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const ReadStateStore = W.findByProps("getUnreadCount", "getMentionCount")
+        ?? W.findByProps("hasUnread", "getUnreadCount");
+    const MessageStore = W.findByProps("getMessage", "getMessages");
+
+    const token = getAuthToken(W);
+
+    let mid = args.messageId;
+    if (!mid) {
+        const msgs = MessageStore?.getMessages?.(args.channelId);
+        const last = msgs?._array?.[msgs._array.length - 1]
+            ?? msgs?.toArray?.()?.slice(-1)[0]
+            ?? null;
+        mid = last?.id || ReadStateStore?.lastMessageId?.(args.channelId);
+        if (!mid) {
+            // REST fallback — fetch the newest message id.
+            const batch = await restFetchMessages(args.channelId, { limit: 1 }, token);
+            mid = batch[0]?.id;
+        }
+    }
+    if (!mid) throw new Error("Could not determine a messageId to ack (channel may be empty).");
+
+    const r = await fetch(
+        `https://discord.com/api/v9/channels/${args.channelId}/messages/${mid}/ack`,
+        {
+            method: "POST",
+            headers: { authorization: token, "content-type": "application/json" },
+            body: JSON.stringify({ token: null, manual: true }),
+        });
+    if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        throw new Error(`Discord REST /ack error ${r.status}: ${text.slice(0, 300)}`);
+    }
+    const ch = ChannelStore?.getChannel?.(args.channelId);
+    return {
+        ok: true,
+        channelId: args.channelId,
+        ackedMessageId: mid,
+        channel: ch ? {
+            id: ch.id,
+            name: ch.name || null,
+            guildId: ch.guild_id || null,
+        } : null,
+    };
+}
+
+/* ------------------------------------------------------- emoji ---------- */
+
+interface EmojiArgs {
+    query?: string;
+    guildId?: string;
+    limit?: number;
+}
+
+/**
+ * List/search custom server emoji across the user's guilds. Returns each as
+ * `{ shortcode }` ready to paste into `discord_send` content or use directly
+ * with `discord_react`'s `<:name:id>` form.
+ */
+function bridgeEmoji(args: EmojiArgs = {}): unknown {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const EmojiStore = W.findByProps("getGuilds", "getDisambiguatedEmojiContext")
+        ?? W.findByProps("getCustomEmojiById", "getUsableCustomEmoji")
+        ?? W.findByProps("getGuildEmoji");
+    const GuildStore = W.findByProps("getGuild", "getGuilds");
+
+    if (!EmojiStore) throw new Error("EmojiStore not found — webpack module shape may have changed.");
+
+    let guildsMap: Record<string, any> = {};
+    if (typeof EmojiStore.getGuilds === "function") {
+        guildsMap = EmojiStore.getGuilds() || {};
+    } else if (typeof EmojiStore.getGuildEmoji === "function" && typeof GuildStore?.getGuilds === "function") {
+        for (const gid of Object.keys(GuildStore.getGuilds())) {
+            const emojis = EmojiStore.getGuildEmoji(gid);
+            if (emojis?.length) guildsMap[gid] = { emojis };
+        }
+    } else {
+        throw new Error("EmojiStore has no recognized listing method.");
+    }
+
+    const q = (args.query || "").trim().toLowerCase();
+    const limit = Math.max(1, Math.min(200, args.limit ?? 25));
+
+    const score = (name: string) => {
+        if (!q) return 0;
+        const lo = name.toLowerCase();
+        if (lo === q) return 100;
+        if (lo.startsWith(q)) return 75;
+        if (lo.includes(q)) return 50;
+        return -1;
+    };
+
+    const out: Array<{ name: string; id: string; animated: boolean; guildId: string; guildName: string | null; url: string; shortcode: string; _score: number; }> = [];
+    for (const [gid, g] of Object.entries(guildsMap)) {
+        if (args.guildId && gid !== args.guildId) continue;
+        const guildName = GuildStore?.getGuild?.(gid)?.name ?? null;
+        for (const e of (g as any).emojis || []) {
+            const s = score(e.name);
+            if (q && s < 0) continue;
+            out.push({
+                name: e.name,
+                id: e.id,
+                animated: !!e.animated,
+                guildId: gid,
+                guildName,
+                url: `https://cdn.discordapp.com/emojis/${e.id}.${e.animated ? "gif" : "png"}?size=96`,
+                shortcode: `<${e.animated ? "a" : ""}:${e.name}:${e.id}>`,
+                _score: s,
+            });
+        }
+    }
+
+    out.sort((a, b) => b._score - a._score || a.name.localeCompare(b.name));
+    return {
+        total: out.length,
+        query: q || undefined,
+        emojis: out.slice(0, limit).map(({ _score, ...rest }) => rest),
+    };
+}
+
+/* ------------------------------------------------------- dm open --------- */
+
+interface DmOpenArgs {
+    userId?: string;
+    userIds?: string[];
+}
+
+/**
+ * Start a DM (or group DM) with a user not yet in the sidebar.
+ * REST: `POST /users/@me/channels` with `{ recipient_id }` or `{ recipients: [] }`.
+ * Returns the channel info in the same shape as `discord_dms` so the result
+ * pipes straight into `discord_send`.
+ */
+async function bridgeDmOpen(args: DmOpenArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const ids = args.userIds?.length ? args.userIds : (args.userId ? [args.userId] : []);
+    if (!ids.length) throw new Error("Provide `userId` or `userIds`.");
+
+    const token = getAuthToken(W);
+    const body = ids.length === 1
+        ? { recipient_id: ids[0] }
+        : { recipients: ids };
+
+    const r = await fetch("https://discord.com/api/v9/users/@me/channels", {
+        method: "POST",
+        headers: { authorization: token, "content-type": "application/json" },
+        body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        throw new Error(`Discord REST /users/@me/channels error ${r.status}: ${text.slice(0, 300)}`);
+    }
+    const ch: any = await r.json();
+
+    const UserStore = W.findByProps("getCurrentUser", "getUser");
+    const RelationshipStore = W.findByProps("getRelationshipType", "isFriend");
+    const renderName = (u: any) => u?.global_name ?? u?.globalName ?? u?.username ?? null;
+
+    const recipients = (ch.recipients || []).map((u: any) => {
+        const cached = UserStore?.getUser?.(u.id);
+        const nickname = RelationshipStore?.getNickname?.(u.id) || null;
+        return {
+            id: u.id,
+            username: u.username || cached?.username,
+            name: renderName(u) || renderName(cached),
+            nickname,
+            bot: !!(u.bot ?? cached?.bot),
+        };
+    });
+    const isGroup = ch.type === 3;
+    const name = isGroup
+        ? (ch.name || recipients.map((r: any) => r.nickname || r.name || r.username).filter(Boolean).join(", ") || "(group)")
+        : (recipients[0]?.nickname || recipients[0]?.name || recipients[0]?.username || "(unknown)");
+
+    return {
+        channelId: ch.id,
+        kind: isGroup ? "group" : "dm",
+        name,
+        memberCount: isGroup ? recipients.length : undefined,
+        recipients,
+    };
+}
+
+/* ------------------------------------------------------- attachment ------ */
+
+interface AttachmentArgs {
+    channelId?: string;
+    messageId: string;
+    index?: number;
+}
+
+/**
+ * Return attachment metadata for a message. The MCP server does the actual
+ * CDN fetch — keeps the bytes off the /eval payload (which is capped at 600 KB
+ * for sanity). Discord's CDN URLs are signed (`ex`/`is`/`hm` query params) and
+ * work from anywhere — no auth needed on the WSL side.
+ */
+async function bridgeAttachment(args: AttachmentArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+    const MessageStore = W.findByProps("getMessage", "getMessages");
+
+    const channelId = args.channelId || SelectedChannelStore?.getChannelId?.();
+    if (!channelId) throw new Error("No channel selected and no channelId provided.");
+    if (!args.messageId) throw new Error("`messageId` is required.");
+
+    const token = getAuthToken(W);
+    const msg = await fetchMessageById(channelId, args.messageId, W, token);
+    if (!msg)
+        throw new Error(`messageId ${args.messageId} not found in channel ${channelId}.`);
+
+    const attachments: any[] = msg.attachments || [];
+    if (!attachments.length)
+        throw new Error(`message ${args.messageId} has no attachments.`);
+
+    const idx = Math.max(0, Math.min(attachments.length - 1, args.index ?? 0));
+    const a = attachments[idx];
+    return {
+        index: idx,
+        attachmentCount: attachments.length,
+        name: a.filename || a.name,
+        url: a.url,
+        proxyUrl: a.proxy_url || a.proxyUrl || null,
+        size: a.size,
+        contentType: a.content_type || a.contentType || null,
+        width: a.width ?? null,
+        height: a.height ?? null,
+    };
+}
+
 /* ----------------------- reply-chain walker + resolveMessage --------------- */
 
 interface ResolveMessageArgs {
@@ -1987,7 +2365,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 17,
+            version: 20,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
@@ -2005,6 +2383,11 @@ export default definePlugin({
             getThreads: bridgeThreads,
             getMember: bridgeMember,
             resolveMessage: bridgeResolveMessage,
+            attachment: bridgeAttachment,
+            dmOpen: bridgeDmOpen,
+            listEmoji: bridgeEmoji,
+            unread: bridgeUnread,
+            ack: bridgeAck,
         };
         // Resume whatever state the toolbar icon was left in last session.
         if (settings.store.bridgeActive) startPolling();

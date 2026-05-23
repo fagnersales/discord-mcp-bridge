@@ -127,7 +127,7 @@ async function runInRenderer(code: string, depth?: number, timeoutMs?: number): 
     }
 }
 
-const mcp = new McpServer({ name: "discord-bridge", version: "2.8.0" });
+const mcp = new McpServer({ name: "discord-bridge", version: "2.9.0" });
 
 mcp.registerTool("discord_eval", {
     description:
@@ -731,6 +731,154 @@ mcp.registerTool("discord_resolveMessage", {
         `  ? globalThis.$discordBridge.resolveMessage(${JSON.stringify(args)})` +
         `  : (() => { throw new Error("DebugBridge resolveMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 6, 60_000);
+});
+
+mcp.registerTool("discord_attachment", {
+    description:
+        "Fetch the bytes of a message attachment so the model can actually see/read it — " +
+        "for image attachments, the bytes come back as an inline image ContentBlock (so " +
+        "the model perceives the image directly); for everything else, base64 in a text " +
+        "block with mime + size. Default `index` is 0 (first attachment). Refuses files " +
+        "larger than `maxBytes` (default 5 MB) — for those, get metadata via " +
+        "`discord_view` / `discord_history` with the `attachments` projection instead. " +
+        "Use this whenever a message references a screenshot, PDF, or other file the " +
+        "user is asking about: without this tool you only see the filename.",
+    inputSchema: {
+        messageId: z.string().describe("Message that owns the attachment. Pull from `discord_view` / `discord_history`."),
+        channelId: z.string().optional().describe("Target channel ID. Omit to use the currently selected channel."),
+        index: z.number().int().min(0).optional().describe("Which attachment on the message (default 0)."),
+        maxBytes: z.number().int().min(1).max(25_000_000).optional().describe("Refuse to return if the file is larger than this (default 5_000_000)."),
+    },
+}, async ({ messageId, channelId, index, maxBytes }) => {
+    const cap = maxBytes ?? 5_000_000;
+    const metaArg = JSON.stringify({ messageId, channelId, index });
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.attachment)` +
+        `  ? globalThis.$discordBridge.attachment(${metaArg})` +
+        `  : (() => { throw new Error("DebugBridge attachment helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    let meta: any;
+    try {
+        const reply = await daemonEval(code, 4, 20_000);
+        if (!reply.ok) return text("Discord renderer error:\n" + (reply.error ?? "unknown error"), true);
+        meta = reply.result;
+    } catch (e) {
+        return text("Bridge error: " + errMsg(e), true);
+    }
+    if (typeof meta?.size === "number" && meta.size > cap) {
+        return text(
+            `Attachment "${meta.name}" is ${meta.size} bytes (> maxBytes ${cap}). ` +
+            `Skipping bytes; metadata only:\n${JSON.stringify(meta, null, 2)}`, true);
+    }
+    if (!meta?.url) return text("Attachment metadata missing URL:\n" + JSON.stringify(meta, null, 2), true);
+    try {
+        const r = await fetch(meta.url, { signal: AbortSignal.timeout(45_000) });
+        if (!r.ok) return text(`CDN fetch failed (${r.status}) for ${meta.url}`, true);
+        const buf = new Uint8Array(await r.arrayBuffer());
+        if (buf.byteLength > cap) {
+            return text(
+                `Attachment "${meta.name}" turned out to be ${buf.byteLength} bytes (> maxBytes ${cap}). ` +
+                `Metadata only:\n${JSON.stringify(meta, null, 2)}`, true);
+        }
+        const mime = (meta.contentType as string | null) || r.headers.get("content-type") || "application/octet-stream";
+        const base64 = Buffer.from(buf).toString("base64");
+        const summary = `Fetched "${meta.name}" (${mime}, ${Math.round(buf.byteLength / 1024)} KB)` +
+            (meta.width ? ` ${meta.width}×${meta.height}px` : "") + ".";
+        if (mime.startsWith("image/")) {
+            return {
+                content: [
+                    { type: "image", data: base64, mimeType: mime },
+                    { type: "text", text: summary },
+                ],
+            };
+        }
+        return text(`${summary}\nbase64:\n${base64}`);
+    } catch (e) {
+        return text("Attachment fetch error: " + errMsg(e), true);
+    }
+});
+
+mcp.registerTool("discord_dm_open", {
+    description:
+        "Open (or fetch) a 1:1 DM with a user, or a group DM with several users — REST " +
+        "`POST /users/@me/channels`. Use when the target person isn't in the DM sidebar " +
+        "yet, so `discord_dms` can't find them. Discord reuses the existing DM if one " +
+        "already exists, so this is safe to call repeatedly. Result shape matches " +
+        "`discord_dms` entries — pipe the `channelId` straight into `discord_send`.",
+    inputSchema: {
+        userId: z.string().optional().describe("Single recipient user ID. Use this for a 1:1 DM."),
+        userIds: z.array(z.string()).min(1).optional().describe("Recipient user IDs for a group DM (2+ recommended)."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.dmOpen)` +
+        `  ? globalThis.$discordBridge.dmOpen(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge dmOpen helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 4, 20_000);
+});
+
+mcp.registerTool("discord_emoji", {
+    description:
+        "List/search custom server emoji across all guilds the user is in. Returns each " +
+        "as `{ name, id, animated, guildId, guildName, url, shortcode }` where " +
+        "`shortcode` is the `<:name:id>` / `<a:name:id>` form ready to paste into " +
+        "`discord_send` content or use directly with `discord_react`. Without this tool " +
+        "the agent has no way to discover what custom emoji exist. Pass `query` for a " +
+        "substring filter; ranked exact > prefix > substring. Output is projection + " +
+        "limited (default 25) because the full set across many guilds is large.",
+    inputSchema: {
+        query: z.string().optional().describe("Case-insensitive substring filter on emoji name."),
+        guildId: z.string().optional().describe("Narrow to one guild."),
+        limit: z.number().int().min(1).max(200).optional().describe("Cap on results (default 25)."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.listEmoji)` +
+        `  ? globalThis.$discordBridge.listEmoji(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge listEmoji helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 4);
+});
+
+mcp.registerTool("discord_unread", {
+    description:
+        "List channels with unread messages — the \"what did I miss?\" lookup. Always " +
+        "scans DMs + group DMs; pass `includeGuilds: true` to also walk every guild text " +
+        "channel the user has access to (heavier — only when needed). Each entry: " +
+        "`{ channelId, kind, name, guildId, guildName, unreadCount, mentionCount, " +
+        "oldestUnreadId, lastReadMessageId }`. Sorted by mentions, then unread count. " +
+        "Pass `mentionsOnly: true` to only return channels where someone pinged the " +
+        "viewer. Pipe a channelId into `discord_history({ after: oldestUnreadId })` to " +
+        "see exactly what was missed.",
+    inputSchema: {
+        includeGuilds: z.boolean().optional().describe("Also scan guild text channels (default false — DMs/groups only)."),
+        mentionsOnly: z.boolean().optional().describe("Only return channels with at least one mention (default false)."),
+        limit: z.number().int().min(1).max(500).optional().describe("Cap on results (default 100)."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.unread)` +
+        `  ? globalThis.$discordBridge.unread(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge unread helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 4, 30_000);
+});
+
+mcp.registerTool("discord_ack", {
+    description:
+        "Mark a channel read up to a message — REST " +
+        "`POST /channels/{id}/messages/{messageId}/ack`. Clears unread badges " +
+        "user-visibly. Not destructive per se, but DOES mutate visible state — only " +
+        "call when the user explicitly asks to mark something read, or after they've " +
+        "obviously caught up on a channel via the agent. Omit `messageId` to ack the " +
+        "channel's most recent message.",
+    inputSchema: {
+        channelId: z.string().describe("Channel to mark read."),
+        messageId: z.string().optional().describe("Ack up to this message ID. Omit for the channel's most recent message."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.ack)` +
+        `  ? globalThis.$discordBridge.ack(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge ack helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 3, 15_000);
 });
 
 mcp.registerTool("discord_reload", {
