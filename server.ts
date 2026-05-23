@@ -19,17 +19,25 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { readFileSync, writeFileSync } from "fs";
+import { appendFileSync, readFileSync, writeFileSync } from "fs";
 import { basename, extname } from "path";
 
 const PORT = 8787;
 const TOKEN = "vc-debug-bridge-2f9a4c1e";
 const BASE = `http://127.0.0.1:${PORT}`;
 const DAEMON_PATH = new URL("./daemon.ts", import.meta.url).pathname;
+const PERF_LOG = new URL("./perf.log", import.meta.url).pathname;
 
 const log = (...a: unknown[]) => console.error("[discord-bridge-mcp]", ...a);
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+/** Append one JSONL row per tool call: timing, outcome, response size. */
+function logPerf(entry: Record<string, unknown>) {
+    try {
+        appendFileSync(PERF_LOG, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
+    } catch { /* never let perf logging break a tool call */ }
+}
 
 /** Hard cap on a single tool result — stops a runaway eval from nuking the context window. */
 const MAX_RESULT_CHARS = 80_000;
@@ -128,6 +136,42 @@ async function runInRenderer(code: string, depth?: number, timeoutMs?: number): 
 }
 
 const mcp = new McpServer({ name: "discord-bridge", version: "2.9.0" });
+
+// Wrap registerTool to time every handler and emit one JSONL row per call to
+// perf.log. Lets us see which tools are slow, which error, and how much
+// payload each returns — without touching individual call sites.
+{
+    const _register = mcp.registerTool.bind(mcp);
+    (mcp as any).registerTool = (name: string, config: any, handler: any) => {
+        const wrapped = async (...args: any[]) => {
+            const start = performance.now();
+            let ok = true;
+            let bytes = 0;
+            let err: string | undefined;
+            try {
+                const result = await handler(...args);
+                ok = !(result as ToolResult | undefined)?.isError;
+                for (const b of (result as ToolResult | undefined)?.content ?? []) {
+                    if (b.type === "text") bytes += b.text.length;
+                    else if (b.type === "image") bytes += b.data.length;
+                }
+                return result;
+            } catch (e) {
+                ok = false;
+                err = errMsg(e);
+                throw e;
+            } finally {
+                logPerf({
+                    tool: name,
+                    ms: Math.round(performance.now() - start),
+                    ok, bytes,
+                    ...(err ? { err } : {}),
+                });
+            }
+        };
+        return _register(name, config, wrapped);
+    };
+}
 
 mcp.registerTool("discord_eval", {
     description:
@@ -936,11 +980,41 @@ mcp.registerTool("discord_wait", {
         (selector ? `selector ${selector}` : "expr") + (last ? ` (last: ${last})` : ""), true);
 });
 
+/** Summarize the tail of perf.log per tool — count / p50 / p95 / errors. */
+function perfSummary(tailLines = 200): string {
+    let raw: string;
+    try { raw = readFileSync(PERF_LOG, "utf8"); }
+    catch { return `perf log: ${PERF_LOG} (no entries yet)`; }
+    const lines = raw.trimEnd().split("\n").slice(-tailLines);
+    if (!lines.length || !lines[0]) return `perf log: ${PERF_LOG} (empty)`;
+    const byTool = new Map<string, { ms: number[]; errs: number; bytes: number }>();
+    for (const line of lines) {
+        try {
+            const e = JSON.parse(line) as { tool: string; ms: number; ok: boolean; bytes?: number };
+            const slot = byTool.get(e.tool) ?? { ms: [], errs: 0, bytes: 0 };
+            slot.ms.push(e.ms);
+            if (!e.ok) slot.errs++;
+            slot.bytes += e.bytes ?? 0;
+            byTool.set(e.tool, slot);
+        } catch { /* skip malformed line */ }
+    }
+    const pct = (xs: number[], p: number) => xs.slice().sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(xs.length * p))];
+    const rows = [...byTool.entries()]
+        .map(([tool, s]) => ({ tool, n: s.ms.length, p50: pct(s.ms, 0.5), p95: pct(s.ms, 0.95), errs: s.errs, kb: Math.round(s.bytes / 1024) }))
+        .sort((a, b) => b.n - a.n);
+    const w = (s: string, n: number) => s.padEnd(n);
+    const head = `${w("tool", 26)} ${w("n", 4)} ${w("p50ms", 6)} ${w("p95ms", 6)} ${w("errs", 4)} kb`;
+    const body = rows.map(r => `${w(r.tool, 26)} ${w(String(r.n), 4)} ${w(String(r.p50), 6)} ${w(String(r.p95), 6)} ${w(String(r.errs), 4)} ${r.kb}`).join("\n");
+    return `perf log: ${PERF_LOG} (last ${lines.length} calls)\n${head}\n${body}`;
+}
+
 mcp.registerTool("discord_status", {
     description:
         "Report bridge health: is the daemon up, is the Discord DebugBridge plugin " +
-        "connected, and a liveness snapshot of the renderer. Call this first when other " +
-        "tools fail.",
+        "connected, and a liveness snapshot of the renderer. Also includes a per-tool " +
+        "perf summary (count / p50 / p95 / errors) over the last 200 calls and the path " +
+        "to the JSONL perf log for deeper analysis. Call this first when other tools " +
+        "fail or feel slow.",
     inputSchema: {},
 }, async () => {
     let s: Record<string, unknown>;
@@ -949,17 +1023,20 @@ mcp.registerTool("discord_status", {
         s = await res.json() as Record<string, unknown>;
     } catch (e) {
         return text("Bridge daemon is unreachable: " + errMsg(e) +
-            "\nThe daemon should auto-spawn — if this persists, check ~/discord-mcp-bridge/daemon.log.", true);
+            "\nThe daemon should auto-spawn — if this persists, check ~/discord-mcp-bridge/daemon.log." +
+            `\n\n${perfSummary()}`, true);
     }
     const uptime = Math.round((s.uptimeMs as number) / 1000);
     if (!s.pluginConnected)
         return text(
             `Daemon: UP (pid ${s.pid}, ${uptime}s uptime).\n` +
             "Discord plugin: DISCONNECTED — no recent poll.\n" +
-            "Fix: start Discord, enable the DebugBridge Vencord plugin, then press Ctrl+R.");
+            "Fix: start Discord, enable the DebugBridge Vencord plugin, then press Ctrl+R." +
+            `\n\n${perfSummary()}`);
     return text(
         `Daemon: UP (pid ${s.pid}, ${uptime}s uptime).  Discord plugin: CONNECTED.\n` +
-        JSON.stringify(s, null, 2));
+        JSON.stringify(s, null, 2) +
+        `\n\n${perfSummary()}`);
 });
 
 /* --------------------------------------------------------------- startup -- */
