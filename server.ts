@@ -127,7 +127,7 @@ async function runInRenderer(code: string, depth?: number, timeoutMs?: number): 
     }
 }
 
-const mcp = new McpServer({ name: "discord-bridge", version: "2.7.0" });
+const mcp = new McpServer({ name: "discord-bridge", version: "2.8.0" });
 
 mcp.registerTool("discord_eval", {
     description:
@@ -438,9 +438,10 @@ mcp.registerTool("discord_view", {
         limit: z.number().int().min(1).max(200).optional().describe("Cap on messages returned (default 100; capped at what's actually rendered)."),
         includeEmbeds: z.boolean().optional().describe("Include embed details (title/desc/url). Default false — only an `embedCount`."),
         includeReactions: z.boolean().optional().describe("Include reaction details (emoji/count/me). Default false — only a `reactionCount`."),
+        resolveReplies: z.number().int().min(0).max(20).optional().describe("For each message with `replyTo`, walk up to N parents and embed them inline as `replyChain` (oldest→newest). REST-fetches parents that aren't in the local store, so this also resolves the `{unloaded: true}` case. Default 0 (no expansion). 2–3 is plenty for normal threads."),
     },
-}, async ({ limit, includeEmbeds, includeReactions }) => {
-    const argJson = JSON.stringify({ limit, includeEmbeds, includeReactions });
+}, async ({ limit, includeEmbeds, includeReactions, resolveReplies }) => {
+    const argJson = JSON.stringify({ limit, includeEmbeds, includeReactions, resolveReplies });
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.getView)` +
         `  ? globalThis.$discordBridge.getView(${argJson})` +
@@ -523,6 +524,7 @@ mcp.registerTool("discord_history", {
         contains: z.string().optional().describe("Filter to messages whose content includes this substring, case-insensitive."),
         limit: z.number().int().min(1).max(5000).optional().describe("Max messages to return (default 200, max 5000). Pages internally; raise only when you really need it."),
         select: z.array(z.enum(["id", "content", "author", "timestamp", "attachments", "replyTo", "mentions", "reactions", "edited"])).optional().describe("Field projection. Default: [id, content, author, timestamp]. `id` is always included. Keep this tight — token usage scales linearly."),
+        resolveReplies: z.number().int().min(0).max(20).optional().describe("Walk each reply's parent chain up to N hops and embed as `replyChain` (oldest→newest). Auto-adds `replyTo` to the projection. Default 0 (no expansion)."),
     },
 }, async (args) => {
     const code =
@@ -586,6 +588,149 @@ mcp.registerTool("discord_stats", {
         `  ? globalThis.$discordBridge.getStats(${JSON.stringify(args)})` +
         `  : (() => { throw new Error("DebugBridge getStats helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 6, 180_000);
+});
+
+mcp.registerTool("discord_react", {
+    description:
+        "Add or remove a reaction on a message — uses Discord's internal " +
+        "`addReaction`/`removeReaction`, the same path the reaction picker uses. " +
+        "Accepts either raw unicode (`\"👍\"`, `\"🔥\"`) or full custom-emoji syntax " +
+        "(`\"<:pepega:1234>\"`, `\"<a:dance:5678>\"`). Shortcodes (`:thumbsup:`) are NOT " +
+        "resolved — paste the unicode character or the `<:name:id>` form. " +
+        "`messageId` is pre-validated against the local MessageStore: a fabricated ID " +
+        "errors instead of silently no-op-ing.",
+    inputSchema: {
+        messageId: z.string().describe("Message to react to. Pull from a fresh `discord_view`/`discord_history` result."),
+        emoji: z.string().describe("Emoji — raw unicode (`👍`) or `<:name:id>` / `<a:name:id>` for custom."),
+        channelId: z.string().optional().describe("Target channel ID. Omit to use the currently selected channel."),
+        action: z.enum(["add", "remove"]).optional().describe("Default `add`. Use `remove` to take your own reaction back off."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.react)` +
+        `  ? globalThis.$discordBridge.react(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge react helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 3);
+});
+
+mcp.registerTool("discord_edit", {
+    description:
+        "Edit one of the viewer's own messages — `MessageActions.editMessage`. " +
+        "Discord only allows editing your own messages, so the tool refuses on " +
+        "anyone else's. `messageId` is pre-validated against MessageStore. " +
+        "Use only on explicit user instruction — editing is visible to recipients " +
+        "as an `(edited)` marker.",
+    inputSchema: {
+        messageId: z.string().describe("Message to edit — must be one you sent. Pull from `discord_view`/`discord_history`."),
+        content: z.string().describe("New full message content (replaces the previous text — this is not a patch)."),
+        channelId: z.string().optional().describe("Target channel ID. Omit to use the currently selected channel."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.editMessage)` +
+        `  ? globalThis.$discordBridge.editMessage(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge editMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 3);
+});
+
+mcp.registerTool("discord_delete", {
+    description:
+        "Delete one of the viewer's own messages — `MessageActions.deleteMessage`. " +
+        "DESTRUCTIVE: the message is gone, recipients lose access immediately, no " +
+        "Discord-side undo. Only invoke on explicit user instruction (\"delete my " +
+        "last message\", \"remove that reply\"); never on inference. The tool " +
+        "refuses on messages the viewer did not send and pre-validates the " +
+        "messageId against MessageStore.",
+    inputSchema: {
+        messageId: z.string().describe("Message to delete — must be one you sent. Pull from `discord_view`/`discord_history`."),
+        channelId: z.string().optional().describe("Target channel ID. Omit to use the currently selected channel."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.deleteMessage)` +
+        `  ? globalThis.$discordBridge.deleteMessage(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge deleteMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 3);
+});
+
+mcp.registerTool("discord_pins", {
+    description:
+        "List a channel's pinned messages via Discord REST — pins are usually " +
+        "the channel's thesis (rules, decisions, links), so this is cheap, " +
+        "high-signal context for orienting in an unfamiliar channel. Each entry " +
+        "uses the same projection shape as `discord_history`.",
+    inputSchema: {
+        channelId: z.string().optional().describe("Target channel ID. Omit to use the currently selected channel."),
+        select: z.array(z.enum(["id", "content", "author", "timestamp", "attachments", "replyTo", "mentions", "reactions", "edited"])).optional().describe("Field projection. Default: [id, content, author, timestamp]."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.getPins)` +
+        `  ? globalThis.$discordBridge.getPins(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge getPins helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 6, 30_000);
+});
+
+mcp.registerTool("discord_threads", {
+    description:
+        "List threads under a parent channel — both active and (optionally) " +
+        "recently archived public threads. Threads are first-class channels in " +
+        "Discord; their IDs are usable as a `channelId` for `discord_view`, " +
+        "`discord_history`, `discord_send`, etc. If you pass a thread's own ID " +
+        "as `channelId`, the tool treats its parent as the listing target.",
+    inputSchema: {
+        channelId: z.string().optional().describe("Parent channel ID. Omit to use the currently selected channel."),
+        includeArchived: z.boolean().optional().describe("Include recently archived public threads (default true)."),
+        archivedLimit: z.number().int().min(1).max(100).optional().describe("How many archived threads to fetch (default 25)."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.getThreads)` +
+        `  ? globalThis.$discordBridge.getThreads(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge getThreads helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 6, 30_000);
+});
+
+mcp.registerTool("discord_member", {
+    description:
+        "Look up a user's full profile — display name, avatar, bio/pronouns, " +
+        "mutual guilds (via `/users/{id}/profile`), plus live status and " +
+        "activities (`PresenceStore`). Useful for disambiguating (\"which " +
+        "Igor?\"), tone calibration (don't ping at 3am), or addressing someone " +
+        "by their `globalName` instead of their `username`. Some users return " +
+        "limited data when you share no context — username/avatar fall back to " +
+        "the local UserStore if the profile API rejects.",
+    inputSchema: {
+        userId: z.string().describe("Discord user ID (snowflake). Pull from `discord_view` / `discord_dms` / message author fields."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.getMember)` +
+        `  ? globalThis.$discordBridge.getMember(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge getMember helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 4, 20_000);
+});
+
+mcp.registerTool("discord_resolveMessage", {
+    description:
+        "Fetch one message + its reply ancestry. REST-fetches anything not in " +
+        "the local MessageStore, so this works even when the parent was " +
+        "scrolled out or is from a different channel. Returns `{ message, " +
+        "replyChain }` — `replyChain` is the parent thread oldest→newest, " +
+        "capped at `depth`. Use when a `discord_view` reply came back as " +
+        "`{unloaded: true}`, or when you want the full conversational arc " +
+        "behind a single message without re-fetching the whole channel.",
+    inputSchema: {
+        messageId: z.string().describe("Message ID to resolve."),
+        channelId: z.string().optional().describe("Channel the message lives in. Omit to use the currently selected channel."),
+        depth: z.number().int().min(0).max(20).optional().describe("Max parent hops to walk (default 5). 0 returns just the message."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.resolveMessage)` +
+        `  ? globalThis.$discordBridge.resolveMessage(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DebugBridge resolveMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 6, 60_000);
 });
 
 mcp.registerTool("discord_reload", {

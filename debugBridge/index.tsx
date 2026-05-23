@@ -536,6 +536,7 @@ interface GetViewArgs {
     limit?: number;
     includeEmbeds?: boolean;
     includeReactions?: boolean;
+    resolveReplies?: number;
 }
 
 /**
@@ -549,7 +550,7 @@ interface GetViewArgs {
  * (author, attachments, reply refs, reactions) — DOM gives the viewport,
  * webpack gives the fidelity.
  */
-function bridgeGetView(args: GetViewArgs = {}): unknown {
+async function bridgeGetView(args: GetViewArgs = {}): Promise<unknown> {
     const W = (globalThis as any).Vencord?.Webpack;
     if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
 
@@ -680,6 +681,35 @@ function bridgeGetView(args: GetViewArgs = {}): unknown {
         clientHeight: scroller.clientHeight,
         atBottom: scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 4,
     } : null;
+
+    // Inline reply-chain expansion: for each rendered message with a `replyTo`,
+    // walk up to N parents (REST-fetching any that aren't in MessageStore) and
+    // embed them as `replyChain` (oldest→newest). Removes `{unloaded: true}`
+    // limitations for replies whose parent was scrolled out.
+    const resolveDepth = Math.max(0, Math.min(20, args.resolveReplies ?? 0));
+    if (resolveDepth > 0) {
+        const token = getAuthToken(W);
+        for (const m of messages) {
+            const startId = m.replyTo?.id;
+            if (!startId) continue;
+            try {
+                m.replyChain = await walkReplyChain(channelId, startId, resolveDepth, W, token);
+                if (m.replyTo?.unloaded && m.replyChain.length) {
+                    // Replace the placeholder with the resolved tip so callers
+                    // don't have to look at two fields.
+                    const tip = m.replyChain[m.replyChain.length - 1];
+                    if (tip && !tip.unloaded) {
+                        m.replyTo = {
+                            id: tip.id,
+                            authorId: tip.author?.id,
+                            authorName: tip.author?.name,
+                            contentPreview: (tip.content || "").slice(0, 160),
+                        };
+                    }
+                }
+            } catch { /* leave the shallow replyTo alone on failure */ }
+        }
+    }
 
     return {
         channel: {
@@ -919,6 +949,7 @@ interface GetHistoryArgs {
     contains?: string;
     limit?: number;
     select?: string[];
+    resolveReplies?: number;
 }
 
 /**
@@ -945,6 +976,10 @@ async function bridgeGetHistory(args: GetHistoryArgs = {}): Promise<unknown> {
     const selectKeys = new Set<string>(
         args.select?.length ? args.select : ["id", "content", "author", "timestamp"]
     );
+    // resolveReplies needs `replyTo` in the projection — auto-add so callers
+    // don't have to remember the dependency.
+    const resolveDepth = Math.max(0, Math.min(20, args.resolveReplies ?? 0));
+    if (resolveDepth > 0) selectKeys.add("replyTo");
     const limit = Math.max(1, Math.min(5000, args.limit ?? 200));
 
     // ISO → snowflake fallback for since/until when explicit before/after not set.
@@ -993,6 +1028,18 @@ async function bridgeGetHistory(args: GetHistoryArgs = {}): Promise<unknown> {
 
     // Currently newest-first → flip to oldest-first.
     out.reverse();
+
+    // Inline reply-chain expansion (post-loop so we only walk for projected messages).
+    if (resolveDepth > 0) {
+        for (const m of out) {
+            const startId = m.replyTo?.id;
+            if (!startId) continue;
+            try {
+                m.replyChain = await walkReplyChain(
+                    m.replyTo.channelId || channelId, startId, resolveDepth, W, token);
+            } catch { /* */ }
+        }
+    }
 
     return {
         channel: channel ? {
@@ -1382,6 +1429,464 @@ async function bridgeOpenChannel(args: OpenChannelArgs): Promise<unknown> {
     };
 }
 
+/* --------------------------------------- react / edit / delete / pins -- */
+
+interface ReactArgs {
+    channelId?: string;
+    messageId: string;
+    emoji: string;
+    action?: "add" | "remove";
+}
+
+/** Parse "<:name:id>", "<a:name:id>", or raw unicode → emoji descriptor for Discord's reaction API. */
+function parseEmoji(input: string): { name: string; id: string | null; animated?: boolean } {
+    const m = input.match(/^<(a?):([^:]+):(\d+)>$/);
+    if (m) return { name: m[2], id: m[3], animated: !!m[1] };
+    const s = input.trim();
+    if (!s) throw new Error("Empty emoji.");
+    if (/^:[^:]+:$/.test(s))
+        throw new Error(
+            `Shortcode ${s} not supported — pass raw unicode (e.g. "👍") or the full "<:name:id>" / "<a:name:id>" form.`);
+    return { name: s, id: null };
+}
+
+/**
+ * Add or remove a reaction on a message. Uses Discord's internal
+ * `ReactionActions.addReaction` / `removeReaction` — the same code path the
+ * reaction picker uses. Pre-validates the messageId against MessageStore so a
+ * fabricated ID fails loudly instead of silently no-op-ing.
+ */
+async function bridgeReact(args: ReactArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const MessageStore = W.findByProps("getMessage", "getMessages");
+    const ReactionActions = W.findByProps("addReaction", "removeReaction");
+
+    const channelId = args.channelId || SelectedChannelStore?.getChannelId?.();
+    if (!channelId) throw new Error("No channel selected and no channelId provided.");
+    if (!args.messageId) throw new Error("`messageId` is required.");
+    if (!args.emoji) throw new Error("`emoji` is required.");
+    const channel = ChannelStore?.getChannel?.(channelId);
+    if (!channel) throw new Error("Channel not found: " + channelId);
+
+    const stored = MessageStore?.getMessage?.(channelId, args.messageId);
+    if (!stored)
+        throw new Error(
+            `messageId ${args.messageId} not found in channel ${channelId}'s local message store. ` +
+            "Pull message IDs from a fresh discord_view result for this channel.");
+
+    const emoji = parseEmoji(args.emoji);
+    const action = args.action ?? "add";
+    if (action !== "add" && action !== "remove")
+        throw new Error("`action` must be 'add' or 'remove'.");
+
+    const fn = action === "add" ? ReactionActions?.addReaction : ReactionActions?.removeReaction;
+    if (!fn) throw new Error(
+        `ReactionActions.${action}Reaction not found — webpack module shape may have changed.`);
+    await fn(channelId, args.messageId, emoji);
+
+    return {
+        ok: true,
+        channelId,
+        messageId: args.messageId,
+        emoji: emoji.id ? `<${emoji.animated ? "a" : ""}:${emoji.name}:${emoji.id}>` : emoji.name,
+        action,
+    };
+}
+
+interface EditArgs {
+    channelId?: string;
+    messageId: string;
+    content: string;
+}
+
+/** Edit one of the viewer's own messages. Refuses to touch other users' messages. */
+async function bridgeEdit(args: EditArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+    const MessageStore = W.findByProps("getMessage", "getMessages");
+    const UserStore = W.findByProps("getCurrentUser", "getUser");
+    const MessageActions = W.findByProps("sendMessage", "editMessage");
+
+    const channelId = args.channelId || SelectedChannelStore?.getChannelId?.();
+    if (!channelId) throw new Error("No channel selected and no channelId provided.");
+    if (!args.messageId) throw new Error("`messageId` is required.");
+    if (typeof args.content !== "string") throw new Error("`content` is required.");
+
+    const stored = MessageStore?.getMessage?.(channelId, args.messageId);
+    if (!stored)
+        throw new Error(
+            `messageId ${args.messageId} not found in channel ${channelId}'s local message store. ` +
+            "Pull message IDs from a fresh discord_view result for this channel.");
+
+    const viewer = UserStore?.getCurrentUser?.();
+    if (!viewer) throw new Error("Current user unavailable from UserStore.");
+    if (stored.author?.id !== viewer.id)
+        throw new Error(
+            `Cannot edit message ${args.messageId}: author is ${stored.author?.id} but viewer is ${viewer.id}. ` +
+            "Discord only allows editing your own messages.");
+
+    if (!MessageActions?.editMessage)
+        throw new Error("MessageActions.editMessage not found — webpack module shape may have changed.");
+    await MessageActions.editMessage(channelId, args.messageId, { content: args.content });
+
+    return { ok: true, channelId, messageId: args.messageId, content: args.content };
+}
+
+interface DeleteArgs {
+    channelId?: string;
+    messageId: string;
+}
+
+/**
+ * Delete one of the viewer's own messages. Author check + pre-validation only —
+ * destructive, but the tool description and the model's general "don't delete
+ * without explicit instruction" caution carry the rest.
+ */
+async function bridgeDelete(args: DeleteArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+    const MessageStore = W.findByProps("getMessage", "getMessages");
+    const UserStore = W.findByProps("getCurrentUser", "getUser");
+    const MessageActions = W.findByProps("sendMessage", "editMessage");
+
+    const channelId = args.channelId || SelectedChannelStore?.getChannelId?.();
+    if (!channelId) throw new Error("No channel selected and no channelId provided.");
+    if (!args.messageId) throw new Error("`messageId` is required.");
+
+    const stored = MessageStore?.getMessage?.(channelId, args.messageId);
+    if (!stored)
+        throw new Error(
+            `messageId ${args.messageId} not found in channel ${channelId}'s local message store. ` +
+            "Pull message IDs from a fresh discord_view result for this channel.");
+
+    const viewer = UserStore?.getCurrentUser?.();
+    if (!viewer) throw new Error("Current user unavailable from UserStore.");
+    if (stored.author?.id !== viewer.id)
+        throw new Error(
+            `Cannot delete message ${args.messageId}: author is ${stored.author?.id} but viewer is ${viewer.id}. ` +
+            "Discord only allows deleting your own messages.");
+
+    if (!MessageActions?.deleteMessage)
+        throw new Error("MessageActions.deleteMessage not found — webpack module shape may have changed.");
+    await MessageActions.deleteMessage(channelId, args.messageId);
+
+    return {
+        ok: true,
+        channelId,
+        messageId: args.messageId,
+        deletedContentPreview: (stored.content || "").slice(0, 200),
+    };
+}
+
+interface PinsArgs {
+    channelId?: string;
+    select?: string[];
+}
+
+/** List pinned messages in a channel via REST. Pins are usually the channel's thesis — cheap context, huge signal. */
+async function bridgePins(args: PinsArgs = {}): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+
+    const channelId = args.channelId || SelectedChannelStore?.getChannelId?.();
+    if (!channelId) throw new Error("No channel selected and no channelId provided.");
+    const channel = ChannelStore?.getChannel?.(channelId);
+    const token = getAuthToken(W);
+
+    const r = await fetch(`https://discord.com/api/v9/channels/${channelId}/pins`, {
+        headers: { authorization: token },
+    });
+    if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        throw new Error(`Discord REST /pins error ${r.status}: ${body.slice(0, 300)}`);
+    }
+    const raw: any[] = await r.json();
+    const select = new Set<string>(
+        args.select?.length ? args.select : ["id", "content", "author", "timestamp"]
+    );
+
+    return {
+        channel: channel ? {
+            id: channel.id,
+            name: channel.name || (channel.recipients?.length ? "(DM)" : null),
+            guildId: channel.guild_id || null,
+        } : { id: channelId },
+        count: raw.length,
+        messages: raw.map(m => projectMessage(m, select)),
+    };
+}
+
+/* ------------------------------------------------------------- threads -- */
+
+interface ThreadsArgs {
+    channelId?: string;
+    includeArchived?: boolean;
+    archivedLimit?: number;
+}
+
+/**
+ * List threads (active + archived public) under a parent channel. Threads are
+ * first-class channels in Discord — the bridge otherwise treats them as
+ * invisible. For guild channels, active threads come from the guild-level
+ * endpoint and are filtered to this parent.
+ */
+async function bridgeThreads(args: ThreadsArgs = {}): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+
+    const channelId = args.channelId || SelectedChannelStore?.getChannelId?.();
+    if (!channelId) throw new Error("No channel selected and no channelId provided.");
+    const channel = ChannelStore?.getChannel?.(channelId);
+    const token = getAuthToken(W);
+    const archivedLimit = Math.max(1, Math.min(100, args.archivedLimit ?? 25));
+
+    const projectThread = (t: any) => ({
+        id: t.id,
+        name: t.name,
+        type: t.type,
+        parentId: t.parent_id ?? t.parentId,
+        archived: !!(t.thread_metadata?.archived ?? t.threadMetadata?.archived),
+        locked: !!(t.thread_metadata?.locked ?? t.threadMetadata?.locked),
+        autoArchiveDuration:
+            t.thread_metadata?.auto_archive_duration ?? t.threadMetadata?.autoArchiveDuration ?? null,
+        archiveTimestamp:
+            t.thread_metadata?.archive_timestamp ?? t.threadMetadata?.archiveTimestamp ?? null,
+        memberCount: t.member_count ?? t.memberCount ?? null,
+        messageCount: t.message_count ?? t.messageCount ?? null,
+        ownerId: t.owner_id ?? t.ownerId ?? null,
+    });
+
+    // If the supplied channel IS a thread, treat its parent as the listing target.
+    const isThread = channel && [10, 11, 12].includes(channel.type);
+    const parentForLookup = isThread ? (channel.parent_id || channelId) : channelId;
+    const guildId = channel?.guild_id;
+
+    const active: any[] = [];
+    if (guildId) {
+        try {
+            const r = await fetch(`https://discord.com/api/v9/guilds/${guildId}/threads/active`, {
+                headers: { authorization: token },
+            });
+            if (r.ok) {
+                const j: any = await r.json();
+                for (const t of j.threads || []) {
+                    if ((t.parent_id || t.parentId) === parentForLookup) active.push(projectThread(t));
+                }
+            }
+        } catch { /* */ }
+    }
+
+    let archived: any[] = [];
+    if (args.includeArchived ?? true) {
+        try {
+            const r = await fetch(
+                `https://discord.com/api/v9/channels/${parentForLookup}/threads/archived/public?limit=${archivedLimit}`,
+                { headers: { authorization: token } });
+            if (r.ok) {
+                const j: any = await r.json();
+                archived = (j.threads || []).map(projectThread);
+            }
+        } catch { /* */ }
+    }
+
+    return {
+        channel: channel ? {
+            id: channel.id,
+            name: channel.name || null,
+            type: channel.type,
+            guildId: guildId || null,
+        } : { id: channelId },
+        parentId: parentForLookup,
+        activeCount: active.length,
+        archivedCount: archived.length,
+        threads: { active, archived },
+    };
+}
+
+/* ---------------------------------------------- member / user profile -- */
+
+interface MemberArgs { userId: string; }
+
+/**
+ * Lookup a user's full profile: REST `/users/{id}/profile` for bio/pronouns/
+ * mutual guilds, PresenceStore for status + activities. Useful for
+ * disambiguation ("which Igor?"), tone calibration, and addressing by
+ * `globalName` instead of username.
+ */
+async function bridgeMember(args: MemberArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+    if (!args.userId) throw new Error("`userId` is required.");
+
+    const UserStore = W.findByProps("getCurrentUser", "getUser");
+    const PresenceStore = W.findByProps("getStatus", "getActivities")
+        ?? W.findByProps("getStatus", "isMobileOnline");
+
+    const token = getAuthToken(W);
+    let profile: any = null;
+    try {
+        const r = await fetch(
+            `https://discord.com/api/v9/users/${args.userId}/profile?with_mutual_guilds=true`,
+            { headers: { authorization: token } });
+        if (r.ok) profile = await r.json();
+        else if (r.status === 404) throw new Error("User not found: " + args.userId);
+        else if (r.status === 403) {
+            // Some users (e.g. via DM-blocked) return 403 — fall through to UserStore.
+        }
+    } catch (e: any) {
+        if (typeof e?.message === "string" && e.message.startsWith("User not found")) throw e;
+        // network error — fall through
+    }
+
+    const u = profile?.user ?? UserStore?.getUser?.(args.userId);
+    if (!u)
+        throw new Error(
+            "User not found via profile API or UserStore: " + args.userId +
+            ". The user may not share any context with you.");
+
+    const renderName = (x: any) => x?.global_name ?? x?.globalName ?? x?.username ?? null;
+    const avatarUrl = u.avatar
+        ? `https://cdn.discordapp.com/avatars/${u.id}/${u.avatar}.${u.avatar.startsWith("a_") ? "gif" : "png"}?size=256`
+        : null;
+    const createdAtMs = Number((BigInt(u.id) >> 22n) + DISCORD_EPOCH);
+
+    const status = PresenceStore?.getStatus?.(args.userId) || null;
+    const activities = (PresenceStore?.getActivities?.(args.userId) || []).map((a: any) => ({
+        name: a.name,
+        type: a.type,
+        state: a.state,
+        details: a.details,
+        applicationId: a.application_id ?? a.applicationId,
+    }));
+    const mutualGuilds = (profile?.mutual_guilds || []).map(
+        (g: any) => ({ id: g.id, nick: g.nick || null }));
+
+    return {
+        id: u.id,
+        username: u.username,
+        globalName: renderName(u),
+        discriminator: u.discriminator && u.discriminator !== "0" ? u.discriminator : undefined,
+        avatarUrl,
+        bot: !!u.bot,
+        createdAt: new Date(createdAtMs).toISOString(),
+        bio: profile?.user_profile?.bio || null,
+        pronouns: profile?.user_profile?.pronouns || null,
+        accentColor: profile?.user_profile?.accent_color ?? null,
+        status,
+        activities,
+        mutualGuilds,
+        mutualGuildCount: mutualGuilds.length,
+    };
+}
+
+/* ----------------------- reply-chain walker + resolveMessage --------------- */
+
+interface ResolveMessageArgs {
+    channelId?: string;
+    messageId: string;
+    depth?: number;
+}
+
+const renderUserName = (u: any) => u?.global_name ?? u?.globalName ?? u?.username ?? null;
+
+function compactMessage(msg: any): any {
+    const tsIso = (t: any) =>
+        typeof t?.toISOString === "function" ? t.toISOString() : (t ? String(t) : null);
+    return {
+        id: msg.id,
+        timestamp: tsIso(msg.timestamp) ?? msg.timestamp ?? null,
+        author: msg.author ? {
+            id: msg.author.id,
+            username: msg.author.username,
+            name: renderUserName(msg.author),
+            bot: !!msg.author.bot,
+        } : null,
+        content: (msg.content || "").slice(0, 800),
+    };
+}
+
+async function fetchMessageById(channelId: string, messageId: string, W: any, token: string): Promise<any | null> {
+    const MessageStore = W.findByProps("getMessage", "getMessages");
+    const cached = MessageStore?.getMessage?.(channelId, messageId);
+    if (cached) return cached;
+    try {
+        const batch = await restFetchMessages(channelId, { limit: 1, around: messageId }, token);
+        return batch.find((m: any) => m.id === messageId) || null;
+    } catch { return null; }
+}
+
+/** Walk a reply chain N parents starting at messageId. Returns oldest→newest. */
+async function walkReplyChain(
+    channelId: string, messageId: string, depth: number, W: any, token: string
+): Promise<any[]> {
+    const chain: any[] = [];
+    let nextChan = channelId;
+    let nextId: string | undefined = messageId;
+    const seen = new Set<string>();
+    for (let i = 0; i < depth && nextId; i++) {
+        const key = nextChan + "/" + nextId;
+        if (seen.has(key)) break;
+        seen.add(key);
+        const msg = await fetchMessageById(nextChan, nextId, W, token);
+        if (!msg) { chain.push({ id: nextId, unloaded: true }); break; }
+        chain.push(compactMessage(msg));
+        const ref = msg.messageReference || msg.message_reference;
+        if (!ref?.message_id) break;
+        nextChan = ref.channel_id || nextChan;
+        nextId = ref.message_id;
+    }
+    return chain.reverse();
+}
+
+/** Fetch one message + its parent chain (depth N). Useful when a `replyTo.id` from another tool is unresolved. */
+async function bridgeResolveMessage(args: ResolveMessageArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+
+    const channelId = args.channelId || SelectedChannelStore?.getChannelId?.();
+    if (!channelId) throw new Error("No channel selected and no channelId provided.");
+    if (!args.messageId) throw new Error("`messageId` is required.");
+
+    const token = getAuthToken(W);
+    const msg = await fetchMessageById(channelId, args.messageId, W, token);
+    if (!msg) throw new Error(`messageId ${args.messageId} not found in channel ${channelId}.`);
+
+    const depth = Math.max(0, Math.min(20, args.depth ?? 5));
+    const ref = msg.messageReference || msg.message_reference;
+    const chain = ref?.message_id
+        ? await walkReplyChain(ref.channel_id || channelId, ref.message_id, depth, W, token)
+        : [];
+
+    const channel = ChannelStore?.getChannel?.(channelId);
+    const projectKeys = new Set(["id", "content", "author", "timestamp", "attachments", "replyTo", "mentions", "reactions", "edited"]);
+    return {
+        channel: channel ? {
+            id: channel.id,
+            name: channel.name || (channel.recipients?.length ? "(DM)" : null),
+            guildId: channel.guild_id || null,
+        } : { id: channelId },
+        message: projectMessage(msg, projectKeys),
+        replyChain: chain,
+    };
+}
+
 /* -------------------------------------------------------- toolbar icon -- */
 
 /** Discord's header-bar icon button — the inbox / help cluster, top right. */
@@ -1482,7 +1987,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 16,
+            version: 17,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
@@ -1493,6 +1998,13 @@ export default definePlugin({
             getHistory: bridgeGetHistory,
             searchMessages: bridgeSearchMessages,
             getStats: bridgeGetStats,
+            react: bridgeReact,
+            editMessage: bridgeEdit,
+            deleteMessage: bridgeDelete,
+            getPins: bridgePins,
+            getThreads: bridgeThreads,
+            getMember: bridgeMember,
+            resolveMessage: bridgeResolveMessage,
         };
         // Resume whatever state the toolbar icon was left in last session.
         if (settings.store.bridgeActive) startPolling();
