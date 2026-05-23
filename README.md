@@ -1,9 +1,11 @@
 # discord-mcp-bridge
 
-A live debugging bridge between a [Claude Code](https://claude.com/claude-code)
-agent and a running Discord ([Vencord](https://github.com/Vendicated/Vencord))
-client. Lets the agent inspect Discord's runtime — webpack modules, the DOM,
-minified class names — and drive its UI, instead of guessing.
+A live bridge between a [Claude Code](https://claude.com/claude-code) agent and
+a running Discord ([Vencord](https://github.com/Vendicated/Vencord)) client.
+The agent can **interact** with Discord — list DMs by name, open a channel,
+read the messages you are currently looking at, and send a message (with a
+pretend-typing indicator, attachments, reply refs) — and **inspect** its
+runtime (webpack modules, the DOM, minified class names) instead of guessing.
 
 ## Architecture — two processes, two roles
 
@@ -50,38 +52,64 @@ press `Ctrl+R` — `discord_status` should then report the plugin connected.
 
 ## MCP tools
 
+### Interaction — talk to people
+
+- `discord_dms({query?, limit?})` — list DMs and group DMs in sidebar order.
+  With `query`, ranks matches by exact > prefix > substring across the DM
+  display name, recipient global / username, **and the Discord friend-nickname
+  the sidebar actually shows** (via `RelationshipStore.getNickname`) — so a
+  query for "Dragãozinha" resolves even when the underlying account is
+  "pitucoco".
+- `discord_open({channelId, messageId?})` — switch Discord to a channel
+  (DM / group / guild). Same code path as the sidebar
+  (`ChannelActions.selectChannel`); optional `messageId` scroll-jumps to that
+  message. Confirms the selection actually flipped.
+- `discord_view({limit?, includeEmbeds?, includeReactions?})` — read what the
+  user is currently looking at: the selected channel + the messages rendered
+  in the viewport. Discord virtualizes off-screen messages out of the DOM, so
+  this is naturally scroll-scoped — if the user scrolled up to look at
+  history, *that* slice is what comes back. Each message includes author info,
+  content, timestamp, attachments, reply ref, mentions; `scroll.atBottom`
+  tells you if the user is following live or browsing history.
+- `discord_send({content?, channelId?, replyToMessageId?, files?, tts?, typing?, typingMs?})`
+  — send a message natively via `MessageActions.sendMessage` (or
+  `UploadManager.uploadFiles` when files are attached). Same code path as
+  Discord's composer, so it is **not** blocked by `isTrusted=false` the way
+  `discord_click` is. `channelId` defaults to the currently selected channel.
+  Set `typing: true` to show the typing indicator first (duration auto-derived
+  from content length, ~60ms/char clamped to 800–6000 ms) or `typingMs: N`
+  for an explicit duration — feels less robotic than instant sends.
+
+### Inspection — debug Discord
+
 - `discord_eval({code?, file?, depth?})` — eval JS in the renderer (expression
   or statements + `return`). `file` evals a local `.js` file; `depth` (1–20,
   default 8) sets result serialization depth.
 - `discord_query(selector, limit?)` — querySelectorAll; returns tags/classes/HTML.
 - `discord_findModule({code?, props?})` — search webpack modules (source / exports).
-- `discord_open({channelId, messageId?})` — switch Discord to a channel
-  (DM/group/guild). Same code path as the sidebar (`ChannelActions.selectChannel`);
-  optional `messageId` scroll-jumps to that message. Confirms the selection
-  actually flipped.
-- `discord_dms({query?, limit?})` — list DMs and group DMs in sidebar order;
-  with `query`, ranks matches by exact > prefix > substring across the DM name,
-  recipient display names, and recipient usernames. Use to resolve "Kavi" →
-  channelId before `discord_send`.
-- `discord_view({limit?, includeEmbeds?, includeReactions?})` — read the selected
-  channel and the messages currently rendered (works with scroll, since Discord
-  virtualizes off-screen messages out of the DOM). Each message has author info,
-  content, attachments, reply ref, mentions; `scroll.atBottom` tells you if the
-  user is following live or browsing history.
-- `discord_send({content?, channelId?, replyToMessageId?, files?, tts?})` — send
-  a message natively via `MessageActions.sendMessage` / `UploadManager.uploadFiles`
-  (not blocked by `isTrusted=false` the way `discord_click` is). `channelId`
-  defaults to the currently selected channel; `files` are absolute paths.
-- `discord_click(selector, index?)` — synthetic pointer/mouse/click on an element.
-- `discord_key(combo, selector?)` — dispatch a key / shortcut, e.g. `"Ctrl+K"`.
-- `discord_console(limit?)` — recent renderer warnings / errors / uncaught.
 - `discord_screenshot({selector?, format?, maxWidth?, quality?})` — capture the
   renderer as an image (whole window, or one element); returns it inline so the
   agent can *see* the UI.
-- `discord_reload()` — reload the renderer and wait until the bridge reconnects.
+- `discord_console(limit?)` — recent renderer warnings / errors / uncaught.
+- `discord_click(selector, index?)` — synthetic pointer/mouse/click on an element.
+- `discord_key(combo, selector?)` — dispatch a key / shortcut, e.g. `"Ctrl+K"`.
 - `discord_wait({selector?, expr?, timeoutMs?})` — block until a selector
   appears or a JS boolean expression is truthy.
+- `discord_reload()` — reload the renderer and wait until the bridge reconnects.
 - `discord_status()` — daemon up? plugin connected? + renderer liveness snapshot.
+
+## Example — "reply to Kavi based on what we've been talking about"
+
+```text
+discord_dms({ query: "kavi" })          → grab the 1:1 channelId
+discord_open({ channelId })             → switch Discord to it
+discord_view({ limit: 30 })             → read recent messages for context
+discord_send({                          → reply, with a natural typing pause
+  channelId, content: "...",
+  replyToMessageId: "...",
+  typing: true,
+})
+```
 
 ## HTTP endpoints (daemon, token required)
 
