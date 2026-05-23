@@ -20,6 +20,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { readFileSync } from "fs";
+import { basename, extname } from "path";
 
 const PORT = 8787;
 const TOKEN = "vc-debug-bridge-2f9a4c1e";
@@ -120,7 +121,7 @@ async function runInRenderer(code: string, depth?: number): Promise<ToolResult> 
     }
 }
 
-const mcp = new McpServer({ name: "discord-bridge", version: "2.1.0" });
+const mcp = new McpServer({ name: "discord-bridge", version: "2.6.0" });
 
 mcp.registerTool("discord_eval", {
     description:
@@ -360,6 +361,130 @@ mcp.registerTool("discord_screenshot", {
         };
     } catch (e) {
         return text("Screenshot error: " + errMsg(e), true);
+    }
+});
+
+/** Cheap extension → mime map. Discord re-sniffs many types, so unknowns fall back to octet-stream. */
+const MIME_BY_EXT: Record<string, string> = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+    ".webp": "image/webp", ".bmp": "image/bmp", ".svg": "image/svg+xml",
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".m4a": "audio/mp4",
+    ".pdf": "application/pdf", ".zip": "application/zip", ".json": "application/json",
+    ".txt": "text/plain", ".md": "text/markdown", ".html": "text/html", ".css": "text/css",
+    ".js": "text/javascript", ".ts": "text/typescript",
+};
+const guessMime = (path: string) => MIME_BY_EXT[extname(path).toLowerCase()] || "application/octet-stream";
+
+mcp.registerTool("discord_open", {
+    description:
+        "Switch Discord to a specific channel (DM, group DM, or guild channel) — same code " +
+        "path the sidebar uses (`ChannelActions.selectChannel`). Optionally scroll-jump to a " +
+        "message via `messageId`. Result confirms whether `SelectedChannelStore` actually " +
+        "flipped, and includes resolved channel + recipients. Typical flow: " +
+        "`discord_dms({query})` → `discord_open({channelId})` → `discord_view()`.",
+    inputSchema: {
+        channelId: z.string().describe("Channel ID to switch to (from `discord_dms`, `discord_view`, or elsewhere)."),
+        messageId: z.string().optional().describe("Optional message ID to scroll-jump to within the channel."),
+    },
+}, async ({ channelId, messageId }) => {
+    const argJson = JSON.stringify({ channelId, messageId });
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.openChannel)` +
+        `  ? globalThis.$discordBridge.openChannel(${argJson})` +
+        `  : (() => { throw new Error("DebugBridge openChannel helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 4);
+});
+
+mcp.registerTool("discord_dms", {
+    description:
+        "List Discord direct messages and group DMs in sidebar order — lets you resolve a " +
+        "person's name to a channelId for `discord_send`. Pass `query` (case-insensitive " +
+        "substring) to filter; results are ranked exact > prefix > substring across the DM " +
+        "display name, recipient display names, and recipient usernames. Each entry returns " +
+        "`{channelId, kind: \"dm\"|\"group\", name, memberCount?, recipients: [{id, username, name, bot}]}`. " +
+        "Typical flow: `discord_dms({query:\"kavi\"})` → grab channelId → `discord_send({channelId, content})`.",
+    inputSchema: {
+        query: z.string().optional().describe("Case-insensitive name filter (substring). Omit to list everything in sidebar order."),
+        limit: z.number().int().min(1).max(100).optional().describe("Cap on results (default: 10 when query, 50 otherwise)."),
+    },
+}, async ({ query, limit }) => {
+    const argJson = JSON.stringify({ query, limit });
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.listDMs)` +
+        `  ? globalThis.$discordBridge.listDMs(${argJson})` +
+        `  : (() => { throw new Error("DebugBridge listDMs helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 6);
+});
+
+mcp.registerTool("discord_view", {
+    description:
+        "Read what the user is currently looking at in Discord — the selected channel and " +
+        "the messages rendered in the viewport. Works with scroll: Discord virtualizes " +
+        "off-screen messages out of the DOM, so if the user scrolls up to look at history, " +
+        "*that* slice is what comes back. Each message includes author info (id, username, " +
+        "display name, bot flag), content, timestamp, attachments, reply ref, and mentions. " +
+        "`scroll.atBottom` tells you if the user is following live or browsing history. " +
+        "Use this as the default \"what's happening here?\" lookup.",
+    inputSchema: {
+        limit: z.number().int().min(1).max(200).optional().describe("Cap on messages returned (default 100; capped at what's actually rendered)."),
+        includeEmbeds: z.boolean().optional().describe("Include embed details (title/desc/url). Default false — only an `embedCount`."),
+        includeReactions: z.boolean().optional().describe("Include reaction details (emoji/count/me). Default false — only a `reactionCount`."),
+    },
+}, async ({ limit, includeEmbeds, includeReactions }) => {
+    const argJson = JSON.stringify({ limit, includeEmbeds, includeReactions });
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.getView)` +
+        `  ? globalThis.$discordBridge.getView(${argJson})` +
+        `  : (() => { throw new Error("DebugBridge getView helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 6);
+});
+
+mcp.registerTool("discord_send", {
+    description:
+        "Send a message in Discord natively — uses `MessageActions.sendMessage` (or " +
+        "`UploadManager.uploadFiles` when attachments are included), the same code path " +
+        "Discord's own composer uses. Unlike `discord_click` + `discord_key`, this is NOT " +
+        "blocked by isTrusted=false. `channelId` defaults to the currently selected channel. " +
+        "Result includes the resolved channel {id, name, guildName} so you can verify where " +
+        "it landed.",
+    inputSchema: {
+        content: z.string().optional().describe("Message text. Required unless `files` is given. Discord parses mentions / markdown as usual."),
+        channelId: z.string().optional().describe("Target channel ID. Omit to use the currently selected channel."),
+        replyToMessageId: z.string().optional().describe("Message ID to reply to (adds a Discord reply reference)."),
+        files: z.array(z.string()).optional().describe("Absolute paths of files to attach. Mime is guessed from extension."),
+        tts: z.boolean().optional().describe("Send as text-to-speech (default false)."),
+        typing: z.boolean().optional().describe("Show the typing indicator before sending; duration auto-derived from content length (~60ms/char, clamped 800ms–6000ms). Ignored if `typingMs` is set."),
+        typingMs: z.number().int().min(0).max(30_000).optional().describe("Explicit typing duration in ms (overrides `typing`). Capped at 30s."),
+    },
+}, async ({ content, channelId, replyToMessageId, files, tts, typing, typingMs }) => {
+    if ((!content || !content.trim()) && (!files || files.length === 0))
+        return text("Provide `content` and/or `files`.", true);
+
+    const fileArgs: { name: string; mime: string; base64: string; }[] = [];
+    if (files?.length) {
+        for (const p of files) {
+            try {
+                const buf = readFileSync(p);
+                fileArgs.push({ name: basename(p), mime: guessMime(p), base64: buf.toString("base64") });
+            } catch (e) {
+                return text(`Failed to read file ${p}: ${errMsg(e)}`, true);
+            }
+        }
+    }
+
+    const argJson = JSON.stringify({ channelId, content, replyToMessageId, files: fileArgs, tts, typing, typingMs });
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.sendMessage)` +
+        `  ? globalThis.$discordBridge.sendMessage(${argJson})` +
+        `  : (() => { throw new Error("DebugBridge sendMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    // Pad timeout to cover the typing-pretend pause + actual send/upload.
+    const typingPad = (typing || typingMs) ? (typingMs ?? 6_000) + 2_000 : 0;
+    const timeoutMs = (fileArgs.length ? 60_000 : 20_000) + typingPad;
+    try {
+        return formatReply(await daemonEval(code, 3, timeoutMs));
+    } catch (e) {
+        return text("Bridge error: " + errMsg(e), true);
     }
 });
 

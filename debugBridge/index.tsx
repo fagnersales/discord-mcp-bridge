@@ -370,6 +370,513 @@ function removeConsoleCapture(): void {
     onError = onRejection = undefined;
 }
 
+/* ------------------------------------------------------- send message -- */
+
+interface SendArgs {
+    channelId?: string;
+    content?: string;
+    replyToMessageId?: string;
+    files?: Array<{ name: string; mime?: string; base64: string; }>;
+    tts?: boolean;
+    typing?: boolean;
+    typingMs?: number;
+}
+
+/**
+ * Send a message natively via Discord's MessageActions / UploadManager —
+ * exposed at `$discordBridge.sendMessage` for the MCP `discord_send` tool.
+ *
+ * Path A (no files): `MessageActions.sendMessage(channelId, msg, undefined, opts)`
+ *   — the same code path Discord's own composer uses; passes through mention
+ *   parsing, slash-command sniffing, reply refs, etc.
+ *
+ * Path B (files): `UploadManager.uploadFiles({...})` — direct upload pipeline
+ *   without the attach-modal `promptToUpload` would otherwise show.
+ *
+ * Always returns the resolved channel info so the agent can verify *where*
+ * the message landed before trusting the send.
+ */
+async function bridgeSendMessage(args: SendArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const MessageActions = W.findByProps("sendMessage", "editMessage");
+    const GuildStore = W.findByProps("getGuild", "getGuilds");
+
+    const id = args.channelId || SelectedChannelStore?.getChannelId?.();
+    if (!id) throw new Error("No channel selected and no channelId provided.");
+    const channel = ChannelStore?.getChannel?.(id);
+    if (!channel) throw new Error("Channel not found: " + id);
+
+    const channelInfo = {
+        id,
+        name: channel.name || (channel.recipients?.length ? "(DM)" : null),
+        guildId: channel.guild_id || null,
+        guildName: channel.guild_id
+            ? (GuildStore?.getGuild?.(channel.guild_id)?.name ?? null)
+            : null,
+    };
+
+    const messageReference = args.replyToMessageId ? {
+        message_id: args.replyToMessageId,
+        channel_id: id,
+        guild_id: channel.guild_id || undefined,
+    } : undefined;
+
+    const tts = !!args.tts;
+    const content = args.content ?? "";
+
+    // Optional "pretend to be typing" pause before the send fires. `typingMs`
+    // is explicit; `typing: true` auto-derives from content length, ~60ms/char
+    // clamped to [800ms, 6000ms] — roughly natural human pacing. Discord
+    // stops the typing indicator automatically when the message lands, so no
+    // explicit stopTyping needed.
+    let typingMs: number | undefined;
+    if (typeof args.typingMs === "number" && args.typingMs > 0) typingMs = args.typingMs;
+    else if (args.typing) {
+        const len = content.length;
+        typingMs = Math.max(800, Math.min(6000, len * 60));
+    }
+    if (typingMs) {
+        const TypingActions = W.findByProps("startTyping", "stopTyping");
+        if (TypingActions?.startTyping) {
+            try { TypingActions.startTyping(id); } catch { /* */ }
+            // Discord's typing indicator self-times out after ~10s; repeat the
+            // start every ~8s so longer pretend-typing durations stay visible.
+            const start = Date.now();
+            while (Date.now() - start < typingMs) {
+                const remaining = typingMs - (Date.now() - start);
+                await new Promise(r => setTimeout(r, Math.min(remaining, 8000)));
+                if (Date.now() - start < typingMs) {
+                    try { TypingActions.startTyping(id); } catch { /* */ }
+                }
+            }
+        }
+    }
+
+    if (args.files?.length) {
+        const fileObjs = args.files.map(f => {
+            const bin = atob(f.base64);
+            const arr = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+            return new File([arr], f.name, { type: f.mime || "application/octet-stream" });
+        });
+
+        const UploadManager = W.findByProps("uploadFiles");
+        if (!UploadManager?.uploadFiles)
+            throw new Error("UploadManager.uploadFiles not found — webpack module shape may have changed.");
+
+        await UploadManager.uploadFiles({
+            channelId: id,
+            draftType: 0,
+            parsedMessage: {
+                content,
+                invalidEmojis: [],
+                tts,
+                channel_id: id,
+                ...(messageReference ? { messageReference } : {}),
+            },
+            uploads: fileObjs.map(file => ({
+                file,
+                platform: 1,
+                isClip: false,
+                isThumbnail: false,
+                draftType: 0,
+            })),
+        });
+    } else {
+        if (!content.trim())
+            throw new Error("`content` is required when no `files` are provided.");
+        if (!MessageActions?.sendMessage)
+            throw new Error("MessageActions.sendMessage not found — webpack module shape may have changed.");
+
+        // 4th arg is `options` — Discord reads `.nonce` off it unconditionally,
+        // so must be an object (never undefined). 3rd arg is the
+        // "wait-for-channel-ready" boolean, default true.
+        await MessageActions.sendMessage(id, {
+            content,
+            invalidEmojis: [],
+            validNonShortcutEmojis: [],
+            tts,
+        }, true, messageReference ? { messageReference } : {});
+    }
+
+    return {
+        ok: true,
+        channel: channelInfo,
+        content,
+        fileCount: args.files?.length || 0,
+        replyTo: args.replyToMessageId || null,
+        tts,
+    };
+}
+
+/* ----------------------------------------------------- view current view -- */
+
+interface GetViewArgs {
+    limit?: number;
+    includeEmbeds?: boolean;
+    includeReactions?: boolean;
+}
+
+/**
+ * Read what the user is currently looking at — the selected channel and the
+ * messages rendered in the viewport. Discord virtualizes off-screen messages
+ * out of the DOM, so scraping `[id^="chat-messages-"]` is naturally
+ * scroll-scoped: if the user scrolled up to look at history, *that* is what
+ * the agent sees here.
+ *
+ * Each rendered ID is then looked up in MessageStore for full message data
+ * (author, attachments, reply refs, reactions) — DOM gives the viewport,
+ * webpack gives the fidelity.
+ */
+function bridgeGetView(args: GetViewArgs = {}): unknown {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const MessageStore = W.findByProps("getMessages", "getMessage");
+    const UserStore = W.findByProps("getCurrentUser", "getUser");
+    const GuildStore = W.findByProps("getGuild", "getGuilds");
+
+    const channelId = SelectedChannelStore?.getChannelId?.();
+    if (!channelId) throw new Error("No channel currently selected.");
+    const channel = ChannelStore?.getChannel?.(channelId);
+    if (!channel) throw new Error("Selected channel not found in ChannelStore: " + channelId);
+
+    const guild = channel.guild_id ? GuildStore?.getGuild?.(channel.guild_id) : null;
+    const viewer = UserStore?.getCurrentUser?.();
+
+    // Discord message DOM IDs: `chat-messages-${channelId}-${messageId}` (or
+    // older `chat-messages-${messageId}` in some surfaces). Pull the trailing
+    // digit run either way; preserve render order; de-dupe.
+    const els = [...document.querySelectorAll<HTMLElement>('[id^="chat-messages-"]')];
+    const limit = Math.max(1, Math.min(200, args.limit ?? 100));
+    const seen = new Set<string>();
+    const ids: string[] = [];
+    for (const el of els) {
+        const m = (el.id || "").match(/(\d{15,})\s*$/);
+        if (!m) continue;
+        const id = m[1];
+        if (seen.has(id)) continue;
+        seen.add(id);
+        ids.push(id);
+    }
+
+    const slice = ids.slice(-limit);
+    const renderName = (u: any) =>
+        u?.globalName ?? u?.global_name ?? u?.username ?? null;
+    const tsIso = (t: any) =>
+        typeof t?.toISOString === "function" ? t.toISOString() : (t ? String(t) : null);
+
+    const messages: any[] = [];
+    let unresolved = 0;
+    for (const id of slice) {
+        const msg = MessageStore?.getMessage?.(channelId, id);
+        if (!msg) { unresolved++; continue; }
+        const out: any = {
+            id: msg.id,
+            timestamp: tsIso(msg.timestamp),
+            author: msg.author ? {
+                id: msg.author.id,
+                username: msg.author.username,
+                name: renderName(msg.author),
+                bot: !!msg.author.bot,
+            } : null,
+            content: msg.content || "",
+        };
+        const edited = tsIso(msg.editedTimestamp);
+        if (edited) out.edited = edited;
+
+        if (msg.attachments?.length) {
+            out.attachments = msg.attachments.map((a: any) => ({
+                name: a.filename || a.name,
+                url: a.url,
+                contentType: a.content_type || a.contentType,
+                size: a.size,
+                width: a.width, height: a.height,
+            }));
+        }
+
+        if (msg.messageReference?.message_id) {
+            const refId = msg.messageReference.message_id;
+            const refChan = msg.messageReference.channel_id || channelId;
+            const ref = MessageStore?.getMessage?.(refChan, refId);
+            out.replyTo = ref ? {
+                id: ref.id,
+                authorId: ref.author?.id,
+                authorName: renderName(ref.author),
+                contentPreview: (ref.content || "").slice(0, 160),
+            } : { id: refId, unloaded: true };
+        }
+
+        if (msg.mentions?.length) {
+            out.mentions = msg.mentions.map((m: any) =>
+                typeof m === "string" ? { id: m } : { id: m.id, name: renderName(m) });
+        }
+        if (msg.mentionRoles?.length) out.mentionRoles = [...msg.mentionRoles];
+        if (msg.mentionEveryone) out.mentionEveryone = true;
+
+        if (msg.embeds?.length) {
+            if (args.includeEmbeds) {
+                out.embeds = msg.embeds.map((e: any) => ({
+                    type: e.type,
+                    title: e.title,
+                    description: (e.description || e.rawDescription || "").slice(0, 400),
+                    url: e.url,
+                    author: e.author?.name,
+                    providerName: e.provider?.name,
+                }));
+            } else {
+                out.embedCount = msg.embeds.length;
+            }
+        }
+
+        if (msg.reactions?.length) {
+            if (args.includeReactions) {
+                out.reactions = msg.reactions.map((r: any) => ({
+                    emoji: r.emoji?.name || r.emoji?.id || String(r.emoji),
+                    count: r.count, me: !!r.me,
+                }));
+            } else {
+                out.reactionCount = msg.reactions.length;
+            }
+        }
+
+        if (msg.flags) out.flags = msg.flags;
+        if (msg.pinned) out.pinned = true;
+        if (msg.type && msg.type !== 0) out.type = msg.type;
+
+        messages.push(out);
+    }
+
+    // The chat scroller — its scrollTop / atBottom hint tells the agent
+    // whether the user is following live (bottom) or browsing history.
+    const scroller = document.querySelector<HTMLElement>(
+        '[class*="messagesWrapper"] [class*="scroller"], [data-list-id="chat-messages"]');
+    const scrollInfo = scroller ? {
+        scrollTop: Math.round(scroller.scrollTop),
+        scrollHeight: scroller.scrollHeight,
+        clientHeight: scroller.clientHeight,
+        atBottom: scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 4,
+    } : null;
+
+    return {
+        channel: {
+            id: channel.id,
+            name: channel.name || (channel.recipients?.length ? "(DM)" : null),
+            type: channel.type,
+            topic: channel.topic || null,
+            guildId: channel.guild_id || null,
+            guildName: guild?.name || null,
+            parentId: channel.parent_id || null,
+        },
+        viewer: viewer ? {
+            id: viewer.id,
+            username: viewer.username,
+            name: renderName(viewer),
+        } : null,
+        scroll: scrollInfo,
+        renderedCount: messages.length,
+        unresolved,
+        messages,
+    };
+}
+
+/* ------------------------------------------------------- list DMs -------- */
+
+interface ListDMsArgs {
+    query?: string;
+    limit?: number;
+}
+
+interface DMEntry {
+    channelId: string;
+    kind: "dm" | "group";
+    name: string;
+    memberCount?: number;
+    recipients: Array<{
+        id: string;
+        username?: string;
+        name?: string | null;
+        nickname?: string | null;
+        bot?: boolean;
+    }>;
+}
+
+/**
+ * List DM + group-DM channels in sidebar order, optionally ranked against a
+ * query string. Lets an agent resolve "Kavi" → channelId without the user
+ * having to dig out an opaque ID.
+ *
+ * Match score, highest wins: exact (100) > prefix (75) > substring (50).
+ * Scored across the DM display name, every recipient's display name, and
+ * every recipient's username.
+ */
+function bridgeListDMs(args: ListDMsArgs = {}): unknown {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const UserStore = W.findByProps("getCurrentUser", "getUser");
+    const SortStore = W.findByProps("getPrivateChannelIds")
+        ?? W.findByProps("getSortedPrivateChannels");
+    // Discord's native friend-nickname store — what the sidebar actually
+    // shows when a user has renamed a friend (e.g. "Avery" → "Dragãozinha").
+    const RelationshipStore = W.findByProps("getRelationshipType", "isFriend");
+
+    // Get DM channel IDs in the order Discord shows them in the sidebar; fall
+    // back to ChannelStore directly if the sort store moved/renamed.
+    let dmIds: string[] = [];
+    if (typeof SortStore?.getPrivateChannelIds === "function") {
+        dmIds = SortStore.getPrivateChannelIds();
+    } else if (typeof ChannelStore?.getSortedPrivateChannels === "function") {
+        dmIds = ChannelStore.getSortedPrivateChannels().map((c: any) => c.id);
+    } else if (typeof ChannelStore?.getMutablePrivateChannels === "function") {
+        dmIds = Object.keys(ChannelStore.getMutablePrivateChannels());
+    } else {
+        throw new Error("No DM-listing webpack module found (getPrivateChannelIds / getSortedPrivateChannels / getMutablePrivateChannels).");
+    }
+
+    const renderName = (u: any) => u?.globalName ?? u?.global_name ?? u?.username ?? null;
+
+    const all: DMEntry[] = dmIds.map(id => {
+        const ch = ChannelStore?.getChannel?.(id);
+        if (!ch) return null;
+        const isGroup = ch.type === 3;
+        const recipientIds: string[] = ch.recipients || ch.recipientIds || [];
+        const recipients = recipientIds.map(rid => {
+            const u = UserStore?.getUser?.(rid);
+            const nickname = RelationshipStore?.getNickname?.(rid) || null;
+            return u ? {
+                id: u.id,
+                username: u.username,
+                name: renderName(u),
+                nickname,
+                bot: !!u.bot,
+            } : { id: rid, nickname };
+        });
+        // For 1:1 DMs, prefer the friend-nickname so the listed `name` matches
+        // what the user actually sees in the sidebar — that is what they will
+        // type when asking the agent to send to "Dragãozinha".
+        const name = isGroup
+            ? (ch.name || recipients.map(r => (r as any).nickname || r.name || r.username).filter(Boolean).join(", ") || "(group)")
+            : ((recipients[0] as any)?.nickname || recipients[0]?.name || recipients[0]?.username || "(unknown)");
+        return {
+            channelId: id,
+            kind: isGroup ? "group" : "dm",
+            name,
+            memberCount: isGroup ? recipients.length : undefined,
+            recipients,
+        };
+    }).filter(Boolean) as DMEntry[];
+
+    const q = (args.query || "").trim().toLowerCase();
+    let results = all;
+    if (q) {
+        const score = (dm: DMEntry) => {
+            const targets = [
+                dm.name,
+                ...dm.recipients.flatMap(r => [(r as any).nickname, r.name, r.username]),
+            ];
+            let best = -1;
+            for (const t of targets) {
+                const lo = (t || "").toLowerCase();
+                if (!lo) continue;
+                if (lo === q) best = Math.max(best, 100);
+                else if (lo.startsWith(q)) best = Math.max(best, 75);
+                else if (lo.includes(q)) best = Math.max(best, 50);
+            }
+            return best;
+        };
+        results = all
+            .map(dm => ({ dm, s: score(dm) }))
+            .filter(x => x.s >= 0)
+            .sort((a, b) => b.s - a.s)
+            .map(x => x.dm);
+    }
+
+    const limit = Math.max(1, Math.min(100, args.limit ?? (q ? 10 : 50)));
+    return {
+        total: all.length,
+        matched: q ? results.length : undefined,
+        query: q || undefined,
+        dms: results.slice(0, limit),
+    };
+}
+
+/* ----------------------------------------------------- open a channel ---- */
+
+interface OpenChannelArgs {
+    channelId: string;
+    messageId?: string;
+}
+
+/**
+ * Switch Discord to a channel — dispatches the same action the sidebar does
+ * (`ChannelActions.selectChannel`). For DMs guildId is null; for guild
+ * channels we look it up from ChannelStore so the caller need not provide it.
+ * `messageId` scroll-jumps to that message (Discord handles the
+ * fetch-around-and-highlight flow).
+ */
+async function bridgeOpenChannel(args: OpenChannelArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
+    const ChannelActions = W.findByProps("selectChannel", "selectVoiceChannel");
+    const GuildStore = W.findByProps("getGuild", "getGuilds");
+    const UserStore = W.findByProps("getCurrentUser", "getUser");
+
+    if (!ChannelActions?.selectChannel)
+        throw new Error("ChannelActions.selectChannel not found — webpack module shape may have changed.");
+
+    const channel = ChannelStore?.getChannel?.(args.channelId);
+    if (!channel) throw new Error("Channel not found in ChannelStore: " + args.channelId);
+
+    const guildId = channel.guild_id || null;
+    ChannelActions.selectChannel({
+        guildId,
+        channelId: args.channelId,
+        messageId: args.messageId,
+    });
+
+    // Selection dispatches synchronously, but the renderer redraw takes a
+    // frame or two. Poll briefly so callers get an accurate "did it flip?".
+    const deadline = Date.now() + 2500;
+    while (Date.now() < deadline) {
+        if (SelectedChannelStore?.getChannelId?.() === args.channelId) break;
+        await new Promise(r => setTimeout(r, 50));
+    }
+
+    const guild = guildId ? GuildStore?.getGuild?.(guildId) : null;
+    const renderName = (u: any) => u?.globalName ?? u?.global_name ?? u?.username ?? null;
+    const recipientIds: string[] = channel.recipients || channel.recipientIds || [];
+    const recipients = recipientIds.map(rid => {
+        const u = UserStore?.getUser?.(rid);
+        return u ? { id: u.id, username: u.username, name: renderName(u) } : { id: rid };
+    });
+
+    const current = SelectedChannelStore?.getChannelId?.();
+    return {
+        ok: current === args.channelId,
+        currentChannelId: current,
+        channel: {
+            id: channel.id,
+            name: channel.name || (recipients[0]?.name ?? recipients[0]?.username ?? null),
+            type: channel.type,
+            guildId,
+            guildName: guild?.name || null,
+            recipients: recipients.length ? recipients : undefined,
+        },
+        scrolledToMessage: args.messageId || null,
+    };
+}
+
 /* -------------------------------------------------------- toolbar icon -- */
 
 /** Discord's header-bar icon button — the inbox / help cluster, top right. */
@@ -470,10 +977,14 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 8,
+            version: 15,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
+            sendMessage: bridgeSendMessage,
+            getView: bridgeGetView,
+            listDMs: bridgeListDMs,
+            openChannel: bridgeOpenChannel,
         };
         // Resume whatever state the toolbar icon was left in last session.
         if (settings.store.bridgeActive) startPolling();

@@ -55,6 +55,23 @@ press `Ctrl+R` — `discord_status` should then report the plugin connected.
   default 8) sets result serialization depth.
 - `discord_query(selector, limit?)` — querySelectorAll; returns tags/classes/HTML.
 - `discord_findModule({code?, props?})` — search webpack modules (source / exports).
+- `discord_open({channelId, messageId?})` — switch Discord to a channel
+  (DM/group/guild). Same code path as the sidebar (`ChannelActions.selectChannel`);
+  optional `messageId` scroll-jumps to that message. Confirms the selection
+  actually flipped.
+- `discord_dms({query?, limit?})` — list DMs and group DMs in sidebar order;
+  with `query`, ranks matches by exact > prefix > substring across the DM name,
+  recipient display names, and recipient usernames. Use to resolve "Kavi" →
+  channelId before `discord_send`.
+- `discord_view({limit?, includeEmbeds?, includeReactions?})` — read the selected
+  channel and the messages currently rendered (works with scroll, since Discord
+  virtualizes off-screen messages out of the DOM). Each message has author info,
+  content, attachments, reply ref, mentions; `scroll.atBottom` tells you if the
+  user is following live or browsing history.
+- `discord_send({content?, channelId?, replyToMessageId?, files?, tts?})` — send
+  a message natively via `MessageActions.sendMessage` / `UploadManager.uploadFiles`
+  (not blocked by `isTrusted=false` the way `discord_click` is). `channelId`
+  defaults to the currently selected channel; `files` are absolute paths.
 - `discord_click(selector, index?)` — synthetic pointer/mouse/click on an element.
 - `discord_key(combo, selector?)` — dispatch a key / shortcut, e.g. `"Ctrl+K"`.
 - `discord_console(limit?)` — recent renderer warnings / errors / uncaught.
