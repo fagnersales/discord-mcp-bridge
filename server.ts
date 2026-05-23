@@ -424,6 +424,8 @@ mcp.registerTool("discord_view", {
         "off-screen messages out of the DOM, so if the user scrolls up to look at history, " +
         "*that* slice is what comes back. Each message includes author info (id, username, " +
         "display name, bot flag), content, timestamp, attachments, reply ref, and mentions. " +
+        "Each message's top-level `id` is the value to pass as `replyToMessageId` to " +
+        "`discord_send` when replying to that specific message. " +
         "`scroll.atBottom` tells you if the user is following live or browsing history. " +
         "Use this as the default \"what's happening here?\" lookup.",
     inputSchema: {
@@ -446,12 +448,15 @@ mcp.registerTool("discord_send", {
         "`UploadManager.uploadFiles` when attachments are included), the same code path " +
         "Discord's own composer uses. Unlike `discord_click` + `discord_key`, this is NOT " +
         "blocked by isTrusted=false. `channelId` defaults to the currently selected channel. " +
-        "Result includes the resolved channel {id, name, guildName} so you can verify where " +
-        "it landed.",
+        "When this message is a direct response to a specific prior message (answering a " +
+        "question, quoting back, follow-up that names what it's reacting to), set " +
+        "`replyToMessageId` so it renders as a native Discord reply — don't rely on temporal " +
+        "proximity alone. Result includes the resolved channel {id, name, guildName} so you " +
+        "can verify where it landed.",
     inputSchema: {
         content: z.string().optional().describe("Message text. Required unless `files` is given. Discord parses mentions / markdown as usual."),
         channelId: z.string().optional().describe("Target channel ID. Omit to use the currently selected channel."),
-        replyToMessageId: z.string().optional().describe("Message ID to reply to (adds a Discord reply reference)."),
+        replyToMessageId: z.string().optional().describe("Message ID to reply to — adds a native Discord reply reference. Prefer this whenever the message is a direct response to a specific prior message (answer, quote-back, named follow-up). Pull the ID from a fresh `discord_view` result; never fabricate — unknown IDs are pre-validated against the local message store and rejected with an error."),
         files: z.array(z.string()).optional().describe("Absolute paths of files to attach. Mime is guessed from extension."),
         tts: z.boolean().optional().describe("Send as text-to-speech (default false)."),
         typing: z.boolean().optional().describe("Show the typing indicator before sending; duration auto-derived from content length (~60ms/char, clamped 800ms–6000ms). Ignored if `typingMs` is set."),

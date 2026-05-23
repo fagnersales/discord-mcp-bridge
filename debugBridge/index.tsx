@@ -425,6 +425,23 @@ async function bridgeSendMessage(args: SendArgs): Promise<unknown> {
         guild_id: channel.guild_id || undefined,
     } : undefined;
 
+    // Pre-validate replyToMessageId against the local MessageStore. Discord
+    // rejects replies to unknown message IDs with a Clyde "could not be
+    // delivered" DM — but the local renderer optimistically shows the message
+    // anyway, so the failure is invisible to the caller. Catching it here
+    // turns a silent delivery failure into a surfaced error.
+    if (args.replyToMessageId) {
+        const MessageStore = W.findByProps("getMessage", "getMessages");
+        const stored = MessageStore?.getMessage?.(id, args.replyToMessageId);
+        if (!stored) {
+            throw new Error(
+                `replyToMessageId ${args.replyToMessageId} not found in channel ${id}'s ` +
+                "local message store. Discord would reject this reply with a Clyde error. " +
+                "Pull message IDs from a fresh discord_view result for this channel."
+            );
+        }
+    }
+
     const tts = !!args.tts;
     const content = args.content ?? "";
 
