@@ -19,7 +19,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { readFileSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 import { basename, extname } from "path";
 
 const PORT = 8787;
@@ -333,14 +333,17 @@ mcp.registerTool("discord_screenshot", {
         "Screenshot the running Discord (Vencord) renderer as an image — to SEE the UI " +
         "(verify a layout/styling change, debug a visual bug). Pass `selector` to capture one " +
         "element (cheaper — fewer tokens — and scrolled into view first); omit for the whole " +
-        "viewport. Only the visible viewport is captured; scroll or navigate first if needed.",
+        "viewport. Only the visible viewport is captured; scroll or navigate first if needed. " +
+        "Pass `savePath` to write the bytes to disk instead of inlining the image — the " +
+        "returned path feeds straight into `discord_send({files: [path]})`.",
     inputSchema: {
         selector: z.string().optional().describe("CSS selector of one element to capture; omit for the full window."),
         format: z.enum(["png", "jpeg"]).optional().describe("Image format (default jpeg — smaller; png is lossless)."),
         maxWidth: z.number().int().min(64).max(4096).optional().describe("Scale down so width ≤ this many px (default 1280)."),
         quality: z.number().int().min(1).max(100).optional().describe("JPEG quality 1–100 (default 70; ignored for png)."),
+        savePath: z.string().optional().describe("Absolute path to write the image bytes to. When set, the image is NOT inlined in the reply — only the path + dimensions text comes back."),
     },
-}, async ({ selector, format, maxWidth, quality }) => {
+}, async ({ selector, format, maxWidth, quality, savePath }) => {
     try {
         const res = await daemonFetch("/screenshot", {
             method: "POST",
@@ -355,14 +358,17 @@ mcp.registerTool("discord_screenshot", {
         if (!reply.ok)
             return text("Screenshot failed:\n" + (reply.error ?? "unknown error"), true);
         const r = reply.result as { data: string; mimeType: string; width: number; height: number; bytes: number };
+        const summary = `${r.width}×${r.height}px ${r.mimeType} (${Math.round(r.bytes / 1024)} KB)` +
+            (selector ? ` of \`${selector}\`` : "");
+        if (savePath) {
+            try { writeFileSync(savePath, Buffer.from(r.data, "base64")); }
+            catch (e) { return text(`Captured ${summary} but failed to write to ${savePath}: ${errMsg(e)}`, true); }
+            return text(`Saved ${summary} → ${savePath}`);
+        }
         return {
             content: [
                 { type: "image", data: r.data, mimeType: r.mimeType },
-                {
-                    type: "text",
-                    text: `Captured ${r.width}×${r.height}px ${r.mimeType} (${Math.round(r.bytes / 1024)} KB)` +
-                        (selector ? ` of \`${selector}\`.` : "."),
-                },
+                { type: "text", text: `Captured ${summary}.` },
             ],
         };
     } catch (e) {
