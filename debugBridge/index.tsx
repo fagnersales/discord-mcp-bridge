@@ -1280,6 +1280,10 @@ async function bridgeGetStats(args: StatsArgs = {}): Promise<unknown> {
     const replyEdges = new Map<string, number>();
     const domains = new Map<string, number>();
     const words = new Map<string, number>();
+    // Same-window id→authorId map. Replies whose parent author isn't inlined
+    // and isn't in MessageStore get resolved against this after paging ends.
+    const authorById = new Map<string, string>();
+    const pendingReplies: Array<{ from: string; refId: string; }> = [];
     let firstTs: string | null = null, lastTs: string | null = null;
 
     while (scanned < hardCap) {
@@ -1299,6 +1303,15 @@ async function bridgeGetStats(args: StatsArgs = {}): Promise<unknown> {
                 if (!authorName.has(aid)) {
                     authorName.set(aid, m.author.global_name ?? m.author.globalName ?? m.author.username);
                 }
+                authorById.set(m.id, aid);
+            }
+            // Also index inlined parent (only set when REST returns it).
+            const refAuthor = m.referenced_message?.author;
+            if (refAuthor?.id) {
+                authorById.set(m.referenced_message.id, refAuthor.id);
+                if (!authorName.has(refAuthor.id)) {
+                    authorName.set(refAuthor.id, refAuthor.global_name ?? refAuthor.globalName ?? refAuthor.username);
+                }
             }
             const ts = m.timestamp || snowflakeToIso(m.id);
             if (ts) {
@@ -1309,12 +1322,19 @@ async function bridgeGetStats(args: StatsArgs = {}): Promise<unknown> {
             if (m.attachments?.length) attachments += m.attachments.length;
             if (m.message_reference?.message_id) {
                 replies++;
+                const refId = m.message_reference.message_id;
                 const refChan = m.message_reference.channel_id || channelId;
-                const stored = MessageStore?.getMessage?.(refChan, m.message_reference.message_id);
-                const toId = stored?.author?.id;
+                let toId: string | undefined =
+                    m.referenced_message?.author?.id ||
+                    authorById.get(refId) ||
+                    MessageStore?.getMessage?.(refChan, refId)?.author?.id;
                 if (aid && toId) {
                     const key = `${aid}→${toId}`;
                     replyEdges.set(key, (replyEdges.get(key) || 0) + 1);
+                } else if (aid) {
+                    // Parent message hasn't been scanned yet (older page) and
+                    // isn't in MessageStore. Resolve after the loop finishes.
+                    pendingReplies.push({ from: aid, refId });
                 }
             }
             const content = m.content || "";
@@ -1327,7 +1347,9 @@ async function bridgeGetStats(args: StatsArgs = {}): Promise<unknown> {
                     domains.set(host, (domains.get(host) || 0) + 1);
                 }
             }
-            const wmatches = content.toLowerCase().match(WORD_RE) || [];
+            // Strip URLs before tokenizing so URL hosts/path words don't pollute topWords.
+            const text = content.replace(/https?:\/\/\S+/gi, " ");
+            const wmatches = text.toLowerCase().match(WORD_RE) || [];
             for (const w of wmatches) {
                 const norm = stripAccents(w);
                 if (STOPWORDS.has(norm)) continue;
@@ -1337,6 +1359,15 @@ async function bridgeGetStats(args: StatsArgs = {}): Promise<unknown> {
         cursor = batch[batch.length - 1].id;
         if (stop) { reachedEnd = true; break; }
         if (batch.length < 100) { reachedEnd = true; break; }
+    }
+
+    // Resolve replies whose parent message was paged in *after* the reply itself.
+    for (const { from, refId } of pendingReplies) {
+        const toId = authorById.get(refId);
+        if (toId) {
+            const key = `${from}→${toId}`;
+            replyEdges.set(key, (replyEdges.get(key) || 0) + 1);
+        }
     }
 
     const total = scanned;
@@ -1488,7 +1519,7 @@ async function bridgeReact(args: ReactArgs): Promise<unknown> {
     const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
     const ChannelStore = W.findByProps("getChannel", "hasChannel");
     const MessageStore = W.findByProps("getMessage", "getMessages");
-    const ReactionActions = W.findByProps("addReaction", "removeReaction");
+    const UserStore = W.findByProps("getCurrentUser", "getUser");
 
     const channelId = args.channelId || SelectedChannelStore?.getChannelId?.();
     if (!channelId) throw new Error("No channel selected and no channelId provided.");
@@ -1508,10 +1539,46 @@ async function bridgeReact(args: ReactArgs): Promise<unknown> {
     if (action !== "add" && action !== "remove")
         throw new Error("`action` must be 'add' or 'remove'.");
 
-    const fn = action === "add" ? ReactionActions?.addReaction : ReactionActions?.removeReaction;
-    if (!fn) throw new Error(
-        `ReactionActions.${action}Reaction not found — webpack module shape may have changed.`);
-    await fn(channelId, args.messageId, emoji);
+    // The reaction action module's property names are minified and change between
+    // Discord builds, so we can't rely on findByProps("addReaction", …). Locate the
+    // module by the dispatch type strings its functions emit, then identify add vs
+    // remove by which dispatch type appears in each function's source.
+    const reactionMod = W.find((m: any) =>
+        m && typeof m === "object"
+        && Object.values(m).some((v: any) => typeof v === "function" && /"MESSAGE_REACTION_ADD"/.test(v.toString()))
+        && Object.values(m).some((v: any) => typeof v === "function" && /"MESSAGE_REACTION_REMOVE"/.test(v.toString())));
+    if (!reactionMod) throw new Error(
+        "Reaction actions module not found — webpack module shape may have changed.");
+
+    // Both add and remove functions reference BOTH dispatch types in their source
+    // (error/retry paths), so a simple "contains ADD but not REMOVE" filter fails.
+    // Distinguish by which dispatch type appears *first* — that's the one the
+    // function actually fires on its happy path.
+    let addFn: ((...a: unknown[]) => unknown) | undefined;
+    let removeFn: ((...a: unknown[]) => unknown) | undefined;
+    for (const v of Object.values(reactionMod) as any[]) {
+        if (typeof v !== "function") continue;
+        const src = v.toString();
+        const addIdx = src.indexOf('"MESSAGE_REACTION_ADD"');
+        const removeIdx = src.indexOf('"MESSAGE_REACTION_REMOVE"');
+        if (addIdx < 0 && removeIdx < 0) continue;
+        const firesAddFirst = addIdx >= 0 && (removeIdx < 0 || addIdx < removeIdx);
+        const firesRemoveFirst = removeIdx >= 0 && (addIdx < 0 || removeIdx < addIdx);
+        if (firesAddFirst && !addFn) addFn = v;
+        else if (firesRemoveFirst && !removeFn) removeFn = v;
+    }
+    if (action === "add" && !addFn) throw new Error("Add-reaction function not found in reaction module.");
+    if (action === "remove" && !removeFn) throw new Error("Remove-reaction function not found in reaction module.");
+
+    if (action === "add") {
+        // Positional signature: (channelId, messageId, emoji, location?, options?)
+        await addFn!(channelId, args.messageId, emoji);
+    } else {
+        // Single-object signature: ({channelId, messageId, emoji, location, userId, options})
+        const userId = UserStore?.getCurrentUser?.()?.id;
+        if (!userId) throw new Error("Could not resolve current user ID for reaction removal.");
+        await removeFn!({ channelId, messageId: args.messageId, emoji, location: "Message", userId });
+    }
 
     return {
         ok: true,
@@ -2365,7 +2432,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 20,
+            version: 22,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
