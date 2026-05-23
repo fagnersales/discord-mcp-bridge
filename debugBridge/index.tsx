@@ -383,15 +383,16 @@ interface SendArgs {
 }
 
 /**
- * Send a message natively via Discord's MessageActions / UploadManager —
- * exposed at `$discordBridge.sendMessage` for the MCP `discord_send` tool.
+ * Send a message natively via Discord's MessageActions — exposed at
+ * `$discordBridge.sendMessage` for the MCP `discord_send` tool.
  *
- * Path A (no files): `MessageActions.sendMessage(channelId, msg, undefined, opts)`
+ * Path A (no files): `MessageActions.sendMessage(channelId, msg, true, opts)`
  *   — the same code path Discord's own composer uses; passes through mention
  *   parsing, slash-command sniffing, reply refs, etc.
  *
- * Path B (files): `UploadManager.uploadFiles({...})` — direct upload pipeline
- *   without the attach-modal `promptToUpload` would otherwise show.
+ * Path B (files): wrap each File in a `CloudUpload` and pass them as
+ *   `options.attachmentsToUpload` to the same `sendMessage` — `_sendMessage`
+ *   runs the upload pipeline + send together, no attach modal.
  *
  * Always returns the resolved channel info so the agent can verify *where*
  * the message landed before trusting the send.
@@ -481,27 +482,31 @@ async function bridgeSendMessage(args: SendArgs): Promise<unknown> {
             return new File([arr], f.name, { type: f.mime || "application/octet-stream" });
         });
 
-        const UploadManager = W.findByProps("uploadFiles");
-        if (!UploadManager?.uploadFiles)
-            throw new Error("UploadManager.uploadFiles not found — webpack module shape may have changed.");
+        // Discord retired the old `UploadManager.uploadFiles(...)` one-shot.
+        // New flow: build CloudUpload instances per file, then call
+        // `MessageActions.sendMessage` with them in `options.attachmentsToUpload`
+        // — `_sendMessage` runs the upload pipeline + send in one go.
+        const CloudUpload = W.findByCode("uploadAnalytics", "preCompressionSize");
+        if (typeof CloudUpload !== "function")
+            throw new Error("CloudUpload class not found — webpack module shape may have changed.");
+        if (!MessageActions?.sendMessage)
+            throw new Error("MessageActions.sendMessage not found — webpack module shape may have changed.");
 
-        await UploadManager.uploadFiles({
-            channelId: id,
-            draftType: 0,
-            parsedMessage: {
-                content,
-                invalidEmojis: [],
-                tts,
-                channel_id: id,
-                ...(messageReference ? { messageReference } : {}),
-            },
-            uploads: fileObjs.map(file => ({
-                file,
-                platform: 1,
-                isClip: false,
-                isThumbnail: false,
-                draftType: 0,
-            })),
+        const uploads = fileObjs.map(file => new CloudUpload({
+            file,
+            platform: 1, // WEB
+            isClip: false,
+            isThumbnail: false,
+        }, id));
+
+        await MessageActions.sendMessage(id, {
+            content,
+            invalidEmojis: [],
+            validNonShortcutEmojis: [],
+            tts,
+        }, true, {
+            attachmentsToUpload: uploads,
+            ...(messageReference ? { messageReference } : {}),
         });
     } else {
         if (!content.trim())
@@ -2432,7 +2437,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 22,
+            version: 23,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
