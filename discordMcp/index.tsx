@@ -1,5 +1,5 @@
 /*
- * Vencord userplugin: DebugBridge
+ * Vencord userplugin: DiscordMCP
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Live debugging bridge for Claude Code.
@@ -40,7 +40,7 @@ const CONSOLE_LIMIT = 200;
  * startup; it is `undefined` if Discord has not been fully restarted since
  * native.ts was added (a Ctrl+R reload does NOT register native handlers).
  */
-const Native = VencordNative.pluginHelpers.DebugBridge as
+const Native = VencordNative.pluginHelpers.DiscordMCP as
     PluginNative<typeof import("./native")> | undefined;
 
 interface LogEntry { level: string; time: string; text: string; }
@@ -268,7 +268,7 @@ async function pollOnce(): Promise<void> {
         clearTimeout(abortTimer);
     }
 
-    if (!connected) origConsole.warn?.call(console, "[DebugBridge] connected:", base);
+    if (!connected) origConsole.warn?.call(console, "[DiscordMCP] connected:", base);
     setConnected(true);
 
     if (res.status === 204 || !res.ok) return;          // no command waiting — re-poll
@@ -2400,7 +2400,7 @@ function ClaudeBridgeButton() {
 /* -------------------------------------------------------------- plugin -- */
 
 export default definePlugin({
-    name: "DebugBridge",
+    name: "DiscordMCP",
     description:
         "Live debugging bridge — lets a local Claude Code agent inspect and eval inside " +
         "this Discord client over localhost HTTP (token-gated). Toggle it from the toolbar.",

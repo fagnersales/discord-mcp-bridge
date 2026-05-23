@@ -1,10 +1,10 @@
 /*
- * Vencord userplugin: DebugBridge — native (main-process) half
+ * Vencord userplugin: DiscordMCP — native (main-process) half
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Runs in Discord's Electron MAIN process. Vencord auto-discovers `native.ts`
  * in a plugin folder and exposes its exports to the renderer half as
- * `VencordNative.pluginHelpers.DebugBridge`.
+ * `VencordNative.pluginHelpers.DiscordMCP`.
  *
  * The renderer cannot read its own pixels — `webContents.capturePage()` lives
  * in the main process — so the screenshot tool hops here. `event.sender` is the

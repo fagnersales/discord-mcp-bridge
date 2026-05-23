@@ -2,7 +2,7 @@
 /**
  * discord-bridge daemon
  * ---------------------
- * Owns :8787 and the long-poll connection to the Vencord "DebugBridge" plugin.
+ * Owns :8787 and the long-poll connection to the Vencord "DiscordMCP" plugin.
  *
  * It is long-lived and a singleton: only one process can bind the port, and a
  * second daemon exits immediately on EADDRINUSE. server.ts (the per-session
@@ -70,7 +70,7 @@ function queueCommand(
         if (!pluginConnected()) {
             reject(new Error(
                 "Discord bridge plugin is not connected (no recent poll). Make sure Discord " +
-                "is running, Vencord is loaded, and the DebugBridge plugin is enabled " +
+                "is running, Vencord is loaded, and the DiscordMCP plugin is enabled " +
                 "(press Ctrl+R in Discord after enabling it)."));
             return;
         }

@@ -448,7 +448,7 @@ mcp.registerTool("discord_open", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.openChannel)` +
         `  ? globalThis.$discordBridge.openChannel(${argJson})` +
-        `  : (() => { throw new Error("DebugBridge openChannel helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP openChannel helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 4);
 });
 
@@ -469,7 +469,7 @@ mcp.registerTool("discord_dms", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.listDMs)` +
         `  ? globalThis.$discordBridge.listDMs(${argJson})` +
-        `  : (() => { throw new Error("DebugBridge listDMs helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP listDMs helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 6);
 });
 
@@ -495,7 +495,7 @@ mcp.registerTool("discord_view", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.getView)` +
         `  ? globalThis.$discordBridge.getView(${argJson})` +
-        `  : (() => { throw new Error("DebugBridge getView helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP getView helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 6);
 });
 
@@ -539,7 +539,7 @@ mcp.registerTool("discord_send", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.sendMessage)` +
         `  ? globalThis.$discordBridge.sendMessage(${argJson})` +
-        `  : (() => { throw new Error("DebugBridge sendMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP sendMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
     // Pad timeout to cover the typing-pretend pause + actual send/upload.
     const typingPad = (typing || typingMs) ? (typingMs ?? 6_000) + 2_000 : 0;
     const timeoutMs = (fileArgs.length ? 60_000 : 20_000) + typingPad;
@@ -580,7 +580,7 @@ mcp.registerTool("discord_history", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.getHistory)` +
         `  ? globalThis.$discordBridge.getHistory(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge getHistory helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP getHistory helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 6, 120_000);
 });
 
@@ -609,7 +609,7 @@ mcp.registerTool("discord_search", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.searchMessages)` +
         `  ? globalThis.$discordBridge.searchMessages(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge searchMessages helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP searchMessages helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 6, 60_000);
 });
 
@@ -636,7 +636,7 @@ mcp.registerTool("discord_stats", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.getStats)` +
         `  ? globalThis.$discordBridge.getStats(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge getStats helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP getStats helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 6, 180_000);
 });
 
@@ -659,7 +659,7 @@ mcp.registerTool("discord_react", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.react)` +
         `  ? globalThis.$discordBridge.react(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge react helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP react helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 3);
 });
 
@@ -679,7 +679,7 @@ mcp.registerTool("discord_edit", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.editMessage)` +
         `  ? globalThis.$discordBridge.editMessage(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge editMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP editMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 3);
 });
 
@@ -699,7 +699,7 @@ mcp.registerTool("discord_delete", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.deleteMessage)` +
         `  ? globalThis.$discordBridge.deleteMessage(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge deleteMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP deleteMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 3);
 });
 
@@ -717,7 +717,7 @@ mcp.registerTool("discord_pins", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.getPins)` +
         `  ? globalThis.$discordBridge.getPins(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge getPins helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP getPins helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 6, 30_000);
 });
 
@@ -737,7 +737,7 @@ mcp.registerTool("discord_threads", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.getThreads)` +
         `  ? globalThis.$discordBridge.getThreads(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge getThreads helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP getThreads helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 6, 30_000);
 });
 
@@ -757,7 +757,7 @@ mcp.registerTool("discord_member", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.getMember)` +
         `  ? globalThis.$discordBridge.getMember(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge getMember helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP getMember helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 4, 20_000);
 });
 
@@ -779,7 +779,7 @@ mcp.registerTool("discord_resolveMessage", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.resolveMessage)` +
         `  ? globalThis.$discordBridge.resolveMessage(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge resolveMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP resolveMessage helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 6, 60_000);
 });
 
@@ -805,7 +805,7 @@ mcp.registerTool("discord_attachment", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.attachment)` +
         `  ? globalThis.$discordBridge.attachment(${metaArg})` +
-        `  : (() => { throw new Error("DebugBridge attachment helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP attachment helper missing — plugin out of date; rebuild & redeploy.") })()`;
     let meta: any;
     try {
         const reply = await daemonEval(code, 4, 20_000);
@@ -862,7 +862,7 @@ mcp.registerTool("discord_dm_open", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.dmOpen)` +
         `  ? globalThis.$discordBridge.dmOpen(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge dmOpen helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP dmOpen helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 4, 20_000);
 });
 
@@ -884,7 +884,7 @@ mcp.registerTool("discord_emoji", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.listEmoji)` +
         `  ? globalThis.$discordBridge.listEmoji(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge listEmoji helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP listEmoji helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 4);
 });
 
@@ -907,7 +907,7 @@ mcp.registerTool("discord_unread", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.unread)` +
         `  ? globalThis.$discordBridge.unread(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge unread helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP unread helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 4, 30_000);
 });
 
@@ -927,7 +927,7 @@ mcp.registerTool("discord_ack", {
     const code =
         `(globalThis.$discordBridge && globalThis.$discordBridge.ack)` +
         `  ? globalThis.$discordBridge.ack(${JSON.stringify(args)})` +
-        `  : (() => { throw new Error("DebugBridge ack helper missing — plugin out of date; rebuild & redeploy.") })()`;
+        `  : (() => { throw new Error("DiscordMCP ack helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 3, 15_000);
 });
 
@@ -1010,7 +1010,7 @@ function perfSummary(tailLines = 200): string {
 
 mcp.registerTool("discord_status", {
     description:
-        "Report bridge health: is the daemon up, is the Discord DebugBridge plugin " +
+        "Report bridge health: is the daemon up, is the DiscordMCP Vencord plugin " +
         "connected, and a liveness snapshot of the renderer. Also includes a per-tool " +
         "perf summary (count / p50 / p95 / errors) over the last 200 calls and the path " +
         "to the JSONL perf log for deeper analysis. Call this first when other tools " +
@@ -1031,7 +1031,7 @@ mcp.registerTool("discord_status", {
         return text(
             `Daemon: UP (pid ${s.pid}, ${uptime}s uptime).\n` +
             "Discord plugin: DISCONNECTED — no recent poll.\n" +
-            "Fix: start Discord, enable the DebugBridge Vencord plugin, then press Ctrl+R." +
+            "Fix: start Discord, enable the DiscordMCP Vencord plugin, then press Ctrl+R." +
             `\n\n${perfSummary()}`);
     return text(
         `Daemon: UP (pid ${s.pid}, ${uptime}s uptime).  Discord plugin: CONNECTED.\n` +

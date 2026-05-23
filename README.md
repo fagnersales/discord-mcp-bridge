@@ -20,7 +20,7 @@ Claude Code sessions are open:
 2. **`server.ts`** — the per-session **MCP stdio server**. Claude Code spawns
    one per session. It owns **no port**; every tool call is proxied over HTTP
    to the daemon. On startup it ensures the daemon is up, spawning it if not.
-3. **`debugBridge/`** — the Vencord userplugin half. Runs in the Discord
+3. **`discordMcp/`** — the Vencord userplugin half. Runs in the Discord
    renderer and **long-polls** the daemon, evaluating the code the agent sends.
 
 ## Why HTTP, not WebSocket
@@ -38,7 +38,7 @@ Needs [Bun](https://bun.sh), Claude Code, and a Vencord **source build**.
 ```bash
 git clone https://github.com/fagnersales/discord-mcp-bridge.git
 cd discord-mcp-bridge
-./install.sh ~/Vencord      # bun install + symlink debugBridge into Vencord
+./install.sh ~/Vencord      # bun install + symlink discordMcp into Vencord
 ```
 
 Then register the MCP server with Claude Code (user scope) and restart it:
@@ -47,7 +47,7 @@ Then register the MCP server with Claude Code (user scope) and restart it:
 claude mcp add discord-bridge -s user -- "$(which bun)" "$PWD/server.ts"
 ```
 
-Build & deploy Vencord, enable the **DebugBridge** plugin in Vencord settings,
+Build & deploy Vencord, enable the **DiscordMCP** plugin in Vencord settings,
 press `Ctrl+R` — `discord_status` should then report the plugin connected.
 
 ## MCP tools
@@ -130,10 +130,10 @@ discord_send({                          → reply, with a natural typing pause
 
 - **Token:** `vc-debug-bridge-2f9a4c1e` is a localhost-only shared secret — it
   only stops other local pages from hitting the endpoint. To change it, edit
-  the `TOKEN` constant in `daemon.ts`, `server.ts`, and `debugBridge/index.tsx`.
+  the `TOKEN` constant in `daemon.ts`, `server.ts`, and `discordMcp/index.tsx`.
 - The plugin polls `http://localhost`, falling back to `http://127.0.0.1`.
 - Daemon logs to `daemon.log` in this directory.
-- **Screenshots use a native helper** (`debugBridge/native.ts`,
+- **Screenshots use a native helper** (`discordMcp/native.ts`,
   `webContents.capturePage()`). Native handlers register only at Discord
   **startup** — after first installing this, fully quit and reopen Discord
   once; `Ctrl+R` is not enough. After that, `Ctrl+R` works as before.
@@ -142,4 +142,4 @@ discord_send({                          → reply, with a natural typing pause
 
 ## License
 
-GPL-3.0-or-later (the `debugBridge` plugin matches Vencord's license).
+GPL-3.0-or-later (the `discordMcp` plugin matches Vencord's license).
