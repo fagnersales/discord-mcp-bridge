@@ -982,7 +982,7 @@ function bridgeListDMs(args: ListDMsArgs = {}): unknown {
             .map(x => x.dm);
     }
 
-    const limit = Math.max(1, Math.min(100, args.limit ?? (q ? 10 : 50)));
+    const limit = Math.max(1, Math.min(100, args.limit ?? (q ? 20 : 50)));
     return {
         total: all.length,
         matched: q ? results.length : undefined,

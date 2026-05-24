@@ -136,7 +136,7 @@ async function runInRenderer(code: string, depth?: number, timeoutMs?: number): 
     }
 }
 
-const mcp = new McpServer({ name: "discord-bridge", version: "2.13.0" });
+const mcp = new McpServer({ name: "discord-bridge", version: "2.13.1" });
 
 // Wrap registerTool to time every handler and emit one JSONL row per call to
 // perf.log. Lets us see which tools are slow, which error, and how much
@@ -468,7 +468,7 @@ mcp.registerTool("discord_dms", {
         "Typical flow: `discord_dms({query:\"kavi\"})` → grab channelId → `discord_send({channelId, content})`.",
     inputSchema: {
         query: z.string().optional().describe("Case-insensitive name filter (substring). Omit to list everything in sidebar order."),
-        limit: z.number().int().min(1).max(100).optional().describe("Cap on results (default: 10 when query, 50 otherwise)."),
+        limit: z.number().int().min(1).max(100).optional().describe("Cap on results (default: 20 when query, 50 otherwise)."),
     },
 }, async ({ query, limit }) => {
     const argJson = JSON.stringify({ query, limit });
