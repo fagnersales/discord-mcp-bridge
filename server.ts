@@ -135,7 +135,7 @@ async function runInRenderer(code: string, depth?: number, timeoutMs?: number): 
     }
 }
 
-const mcp = new McpServer({ name: "discord-bridge", version: "2.9.0" });
+const mcp = new McpServer({ name: "discord-bridge", version: "2.10.0" });
 
 // Wrap registerTool to time every handler and emit one JSONL row per call to
 // perf.log. Lets us see which tools are slow, which error, and how much
@@ -929,6 +929,56 @@ mcp.registerTool("discord_ack", {
         `  ? globalThis.$discordBridge.ack(${JSON.stringify(args)})` +
         `  : (() => { throw new Error("DiscordMCP ack helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 3, 15_000);
+});
+
+mcp.registerTool("discord_guilds", {
+    description:
+        "Read the left-sidebar guild layout — folders and top-level guilds in display order. " +
+        "Each entry is either `{kind:\"guild\", guildId, name}` or " +
+        "`{kind:\"folder\", id, name, color, expanded, guildIds, guilds:[{id,name}]}`. " +
+        "`color` is a 24-bit RGB integer (Discord renders it as the folder swatch). " +
+        "Pipe the returned `sidebar` array straight into `discord_organize` after mutating " +
+        "it — every guildId must appear exactly once across all entries.",
+    inputSchema: {},
+}, async () => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.listGuilds)` +
+        `  ? globalThis.$discordBridge.listGuilds()` +
+        `  : (() => { throw new Error("DiscordMCP listGuilds helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 6);
+});
+
+mcp.registerTool("discord_organize", {
+    description:
+        "Rewrite the left-sidebar guild layout — reorder, group into folders, rename / " +
+        "recolor folders, ungroup, move guilds between folders. `sidebar` is the full ordered " +
+        "list of top-level entries; every guild the user is in must appear exactly once. " +
+        "Entry forms:\n" +
+        "  `{kind:\"guild\", guildId}` — a top-level guild\n" +
+        "  `{kind:\"folder\", guildIds:[...], name?, color?, id?}` — a folder of guilds\n" +
+        "`color` is a 24-bit RGB integer (e.g. 3447003 = blue). `id` is auto-minted if " +
+        "omitted; pass through an existing folder's `id` to preserve identity " +
+        "(expanded/collapsed state across edits). " +
+        "Default is dry-run (returns the resolved preview without writing). Pass " +
+        "`apply: true` to commit via Discord's user settings proto — change syncs to all " +
+        "the user's other Discord clients.",
+    inputSchema: {
+        sidebar: z.array(z.object({
+            kind: z.enum(["guild", "folder"]).optional(),
+            guildId: z.string().optional(),
+            guildIds: z.array(z.string()).optional(),
+            name: z.string().optional(),
+            color: z.number().int().min(0).optional(),
+            id: z.union([z.number(), z.string()]).optional(),
+        })).describe("Full ordered list of sidebar entries. Every guild must appear exactly once."),
+        apply: z.boolean().optional().describe("Default false (dry-run). Pass true to actually write the new layout."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.organizeGuilds)` +
+        `  ? globalThis.$discordBridge.organizeGuilds(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DiscordMCP organizeGuilds helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 6, 30_000);
 });
 
 mcp.registerTool("discord_reload", {

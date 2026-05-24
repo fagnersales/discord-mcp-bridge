@@ -79,6 +79,25 @@ press `Ctrl+R` — `discord_status` should then report the plugin connected.
   Set `typing: true` to show the typing indicator first (duration auto-derived
   from content length, ~60ms/char clamped to 800–6000 ms) or `typingMs: N`
   for an explicit duration — feels less robotic than instant sends.
+- `discord_guilds()` — read the left-sidebar layout: top-level guilds and
+  folders in display order. Each entry is
+  `{kind:"guild", guildId, name}` or
+  `{kind:"folder", id, name, color, expanded, guildIds, guilds:[{id,name}]}`.
+  `color` is a 24-bit RGB integer (the Discord folder swatch). A separate
+  `orphans` array lists guilds the user is in but not referenced by any
+  entry (Discord parks newly-joined guilds there).
+- `discord_organize({sidebar, apply?})` — rewrite the sidebar layout: reorder,
+  group into folders, rename / recolor folders, ungroup, move guilds between
+  folders. `sidebar` is the full ordered list of top-level entries; every
+  guild in `GuildStore` must appear exactly once across all entries. Entry
+  forms: `{kind:"guild", guildId}` (top-level) or
+  `{kind:"folder", guildIds:[...], name?, color?, id?}` (folder). Pass an
+  existing folder's `id` from `discord_guilds` to preserve expand/collapse
+  state; omit it to auto-mint. **Default is dry-run** — returns the resolved
+  preview without writing. Pass `apply: true` to commit via Discord's user
+  settings proto (syncs to the user's other Discord clients). The tool rejects
+  unknown guildIds — strip "ghost" entries (left guilds still in proto) before
+  retrying; append new joins (`orphans`) explicitly so they aren't dropped.
 
 ### Inspection — debug Discord
 

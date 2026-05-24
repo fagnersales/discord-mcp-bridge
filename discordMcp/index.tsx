@@ -2337,6 +2337,206 @@ async function bridgeResolveMessage(args: ResolveMessageArgs): Promise<unknown> 
     };
 }
 
+/* ----------------------------------------------- guild folder organize -- */
+
+interface SidebarEntry {
+    kind?: "folder" | "guild";
+    guildId?: string;
+    guildIds?: string[];
+    name?: string;
+    color?: number | string;
+    expanded?: boolean;
+    id?: number | string;
+}
+
+interface OrganizeArgs {
+    sidebar: SidebarEntry[];
+    apply?: boolean;
+}
+
+/** Locate the PreloadedUserSettings proto-actions module (type === 1). */
+function getPreloadedUserSettings(): any {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+    const all = typeof W.findAll === "function"
+        ? W.findAll((m: any) => m?.ProtoClass && m?.updateAsync)
+        : [];
+    const preloaded = all.find((m: any) => m.type === 1);
+    if (!preloaded) throw new Error("PreloadedUserSettings proto-actions module not found.");
+    return preloaded;
+}
+
+/** Read the current sidebar layout — folders + top-level guilds, in order. */
+function bridgeListGuilds(): unknown {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const GuildStore = W.findByProps("getGuild", "getGuilds");
+    const SortedGuildStore = W.findByProps("getGuildFolders");
+    const allGuildsMap: Record<string, any> = GuildStore?.getGuilds?.() ?? {};
+    const folders: any[] = SortedGuildStore?.getGuildFolders?.() ?? [];
+
+    // SortedGuildStore exposes flat entries: a "folder with no folderId/name"
+    // is a top-level single guild; everything else is a real folder.
+    const sidebar = folders.map(f => {
+        const isFolder = f.folderId != null;
+        if (isFolder) {
+            return {
+                kind: "folder" as const,
+                id: String(f.folderId),
+                name: f.folderName ?? "",
+                color: f.folderColor ?? null,
+                expanded: f.expanded !== false,
+                guildIds: [...(f.guildIds ?? [])],
+                guilds: (f.guildIds ?? []).map((gid: string) => ({
+                    id: gid,
+                    name: allGuildsMap[gid]?.name ?? null,
+                })),
+            };
+        }
+        const gid = f.guildIds?.[0];
+        return {
+            kind: "guild" as const,
+            guildId: gid,
+            name: gid ? (allGuildsMap[gid]?.name ?? null) : null,
+        };
+    });
+
+    // Cover any guilds the user is in but not listed (defensive — shouldn't happen)
+    const referenced = new Set<string>();
+    for (const f of folders) for (const id of (f.guildIds ?? [])) referenced.add(id);
+    const orphans = Object.keys(allGuildsMap).filter(id => !referenced.has(id));
+
+    return {
+        totalGuilds: Object.keys(allGuildsMap).length,
+        entries: sidebar.length,
+        sidebar,
+        orphans: orphans.length ? orphans.map(id => ({ id, name: allGuildsMap[id]?.name })) : undefined,
+    };
+}
+
+/**
+ * Apply a new sidebar layout. `args.sidebar` is the full ordered list of
+ * top-level entries: each entry is either a single guild (`{guildId}`) or a
+ * folder (`{guildIds, name?, color?, id?}`). Every guild the user is in must
+ * appear exactly once across all entries.
+ *
+ * Default is dry-run: returns the diff without writing. Pass `apply: true` to
+ * commit the change via `PreloadedUserSettings.updateAsync("guildFolders", ...)`.
+ *
+ * Folder field shape (from the proto):
+ *   - `id`:    google.protobuf.Int64Value   → `{ value: BigInt }`
+ *   - `name`:  google.protobuf.StringValue  → `{ value: string }`
+ *   - `color`: google.protobuf.UInt64Value  → `{ value: BigInt }`
+ * Bare top-level guilds are written as `{ guildIds: [id] }` only.
+ */
+async function bridgeOrganizeGuilds(args: OrganizeArgs): Promise<unknown> {
+    if (!args || !Array.isArray(args.sidebar))
+        throw new Error("Expected `sidebar: SidebarEntry[]`.");
+
+    const W = (globalThis as any).Vencord?.Webpack;
+    const GuildStore = W.findByProps("getGuild", "getGuilds");
+    const allGuildsMap: Record<string, any> = GuildStore?.getGuilds?.() ?? {};
+    const knownGuildIds = new Set(Object.keys(allGuildsMap));
+
+    const seen = new Set<string>();
+    type BuiltEntry =
+        | { kind: "guild"; guildIds: [string] }
+        | { kind: "folder"; guildIds: string[]; id?: bigint; name?: string; color?: bigint };
+    const built: BuiltEntry[] = [];
+    const errors: string[] = [];
+
+    for (let i = 0; i < args.sidebar.length; i++) {
+        const e = args.sidebar[i];
+        const kind = e.kind ?? (e.guildIds != null ? "folder" : "guild");
+        if (kind === "guild") {
+            const gid = e.guildId ?? (e.guildIds && e.guildIds[0]);
+            if (!gid) { errors.push(`entries[${i}]: missing guildId`); continue; }
+            if (!knownGuildIds.has(gid)) { errors.push(`entries[${i}]: unknown guildId ${gid}`); continue; }
+            if (seen.has(gid)) { errors.push(`entries[${i}]: duplicate guildId ${gid}`); continue; }
+            seen.add(gid);
+            built.push({ kind: "guild", guildIds: [gid] });
+        } else {
+            const gids = e.guildIds ?? [];
+            if (!gids.length) { errors.push(`entries[${i}]: folder must have ≥1 guildIds`); continue; }
+            const folder: BuiltEntry = { kind: "folder", guildIds: [] };
+            for (const gid of gids) {
+                if (!knownGuildIds.has(gid)) { errors.push(`entries[${i}]: unknown guildId ${gid}`); continue; }
+                if (seen.has(gid)) { errors.push(`entries[${i}]: duplicate guildId ${gid}`); continue; }
+                seen.add(gid);
+                folder.guildIds.push(gid);
+            }
+            if (!folder.guildIds.length) continue;
+            // Folder identity: an `id` value lets Discord track the folder across
+            // edits (expanded/collapsed state, etc.). Auto-mint one if missing.
+            try { folder.id = e.id != null ? BigInt(e.id) : BigInt(Date.now()) * 1000n + BigInt(i); }
+            catch { errors.push(`entries[${i}]: bad folder id ${e.id}`); }
+            if (e.name != null) folder.name = String(e.name);
+            if (e.color != null) {
+                try { folder.color = BigInt(e.color); }
+                catch { errors.push(`entries[${i}]: bad folder color ${e.color}`); }
+            }
+            built.push(folder);
+        }
+    }
+
+    const missing = [...knownGuildIds].filter(g => !seen.has(g));
+    if (missing.length)
+        errors.push(`missing guilds (must appear exactly once): ${missing.slice(0, 8).join(", ")}` +
+            (missing.length > 8 ? ` … (+${missing.length - 8})` : ""));
+
+    // Build the diff snapshot (resolved names) for the caller.
+    const resolvedPreview = built.map(b => {
+        if (b.kind === "guild") {
+            const gid = b.guildIds[0];
+            return { kind: "guild", guildId: gid, name: allGuildsMap[gid]?.name ?? null };
+        }
+        return {
+            kind: "folder",
+            id: String(b.id),
+            name: b.name ?? "",
+            color: b.color != null ? String(b.color) : null,
+            guildIds: b.guildIds,
+            guilds: b.guildIds.map(gid => ({ id: gid, name: allGuildsMap[gid]?.name ?? null })),
+        };
+    });
+
+    if (errors.length) {
+        return { applied: false, errors, preview: resolvedPreview };
+    }
+
+    if (!args.apply) {
+        return {
+            applied: false,
+            dryRun: true,
+            note: "Dry run — no changes applied. Pass `apply: true` to commit.",
+            preview: resolvedPreview,
+        };
+    }
+
+    // Translate to the proto shape and write.
+    const protoFolders = built.map(b => {
+        if (b.kind === "guild") return { guildIds: b.guildIds };
+        const out: any = { guildIds: b.guildIds };
+        if (b.id != null) out.id = { value: b.id };
+        if (b.name != null) out.name = { value: b.name };
+        if (b.color != null) out.color = { value: b.color };
+        return out;
+    });
+
+    const preloaded = getPreloadedUserSettings();
+    await preloaded.updateAsync("guildFolders",
+        (proto: any) => { proto.folders = protoFolders; },
+        0,
+        (e: any) => { (globalThis as any).$discordBridge?.console?.push?.({ level: "error", time: new Date().toISOString(), text: "guildFolders updateAsync onError: " + String(e?.message || e) }); });
+
+    return {
+        applied: true,
+        entries: protoFolders.length,
+        layout: resolvedPreview,
+    };
+}
+
 /* -------------------------------------------------------- toolbar icon -- */
 
 /** Discord's header-bar icon button — the inbox / help cluster, top right. */
@@ -2437,7 +2637,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 23,
+            version: 24,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
@@ -2460,6 +2660,8 @@ export default definePlugin({
             listEmoji: bridgeEmoji,
             unread: bridgeUnread,
             ack: bridgeAck,
+            listGuilds: bridgeListGuilds,
+            organizeGuilds: bridgeOrganizeGuilds,
         };
         // Resume whatever state the toolbar icon was left in last session.
         if (settings.store.bridgeActive) startPolling();
