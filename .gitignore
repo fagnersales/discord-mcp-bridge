@@ -3,3 +3,4 @@ daemon.log
 *.log
 *.bak
 .DS_Store
+notes.json

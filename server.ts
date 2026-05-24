@@ -27,6 +27,7 @@ const TOKEN = "vc-debug-bridge-2f9a4c1e";
 const BASE = `http://127.0.0.1:${PORT}`;
 const DAEMON_PATH = new URL("./daemon.ts", import.meta.url).pathname;
 const PERF_LOG = new URL("./perf.log", import.meta.url).pathname;
+const NOTES_PATH = new URL("./notes.json", import.meta.url).pathname;
 
 const log = (...a: unknown[]) => console.error("[discord-bridge-mcp]", ...a);
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -135,7 +136,7 @@ async function runInRenderer(code: string, depth?: number, timeoutMs?: number): 
     }
 }
 
-const mcp = new McpServer({ name: "discord-bridge", version: "2.10.0" });
+const mcp = new McpServer({ name: "discord-bridge", version: "2.13.0" });
 
 // Wrap registerTool to time every handler and emit one JSONL row per call to
 // perf.log. Lets us see which tools are slow, which error, and how much
@@ -437,7 +438,12 @@ mcp.registerTool("discord_open", {
         "Switch Discord to a specific channel (DM, group DM, or guild channel) — same code " +
         "path the sidebar uses (`ChannelActions.selectChannel`). Optionally scroll-jump to a " +
         "message via `messageId`. Result confirms whether `SelectedChannelStore` actually " +
-        "flipped, and includes resolved channel + recipients. Typical flow: " +
+        "flipped, and includes resolved channel + recipients.\n\n" +
+        "RULE: when the user names the target by phrase rather than ID (\"my group\", " +
+        "\"the gamers chat\", a nickname), call `discord_notes` `recall` FIRST — the user " +
+        "stores aliases there mapping phrases → channelIds. Only fall back to `discord_dms` " +
+        "/ `discord_guilds` search if no alias matches.\n\n" +
+        "Typical flow: `discord_notes(recall)` → if alias hit, use its channelId → else " +
         "`discord_dms({query})` → `discord_open({channelId})` → `discord_view()`.",
     inputSchema: {
         channelId: z.string().describe("Channel ID to switch to (from `discord_dms`, `discord_view`, or elsewhere)."),
@@ -504,7 +510,14 @@ mcp.registerTool("discord_send", {
         "Send a message in Discord natively — uses `MessageActions.sendMessage` (or " +
         "`UploadManager.uploadFiles` when attachments are included), the same code path " +
         "Discord's own composer uses. Unlike `discord_click` + `discord_key`, this is NOT " +
-        "blocked by isTrusted=false. `channelId` defaults to the currently selected channel. " +
+        "blocked by isTrusted=false. `channelId` defaults to the currently selected channel.\n\n" +
+        "RULE — resolve target before sending: whenever the user names the destination by " +
+        "phrase rather than an explicit channelId (\"send to my group\", \"tell kavi\", " +
+        "\"in the thinking chat\"), call `discord_notes` `recall` FIRST. The user stores " +
+        "alias / friend / group notes there with `channelId` and `userId` tags — those are " +
+        "the canonical resolution. Also recall notes attached to the resolved channelId / " +
+        "userId before composing, so style rules, in-jokes, and tone get applied. Only fall " +
+        "back to `discord_dms` / `discord_guilds` search if no alias matches.\n\n" +
         "When this message is a direct response to a specific prior message (answering a " +
         "question, quoting back, follow-up that names what it's reacting to), set " +
         "`replyToMessageId` so it renders as a native Discord reply — don't rely on temporal " +
@@ -1057,6 +1070,150 @@ function perfSummary(tailLines = 200): string {
     const body = rows.map(r => `${w(r.tool, 26)} ${w(String(r.n), 4)} ${w(String(r.p50), 6)} ${w(String(r.p95), 6)} ${w(String(r.errs), 4)} ${r.kb}`).join("\n");
     return `perf log: ${PERF_LOG} (last ${lines.length} calls)\n${head}\n${body}`;
 }
+
+/* ---------------------------------------------------------------- notes -- */
+
+interface NoteEntry {
+    value: string;
+    topic: string;
+    updated: string;
+    userId?: string;
+    channelId?: string;
+}
+type NotesFile = Record<string, NoteEntry>;
+
+function readNotes(path: string): NotesFile {
+    try {
+        const raw = readFileSync(path, "utf8");
+        const parsed = JSON.parse(raw);
+        return (parsed && typeof parsed === "object") ? parsed as NotesFile : {};
+    } catch { return {}; }
+}
+
+function writeNotes(path: string, notes: NotesFile): void {
+    writeFileSync(path, JSON.stringify(notes, null, 2));
+}
+
+/** Drop falsy/empty fields so JSON.stringify produces compact entries. */
+function compact<T extends Record<string, unknown>>(o: T): Partial<T> {
+    const out: Partial<T> = {};
+    for (const [k, v] of Object.entries(o)) if (v !== undefined && v !== "" && v !== null) (out as any)[k] = v;
+    return out;
+}
+
+mcp.registerTool("discord_notes", {
+    description:
+        "Persistent local notebook for personal context about the user and their Discord " +
+        "world — writing style, recurring contacts, group conventions, aliases, " +
+        "preferences. Stored locally as a flat key→entry map; nothing leaves the machine.\n\n" +
+        "MANDATORY USAGE: call `recall` (no filter) at the start of any task that involves " +
+        "sending, replying, opening, or otherwise targeting a Discord channel / user / " +
+        "group. The notebook is the user's source of truth for what \"my group\", " +
+        "\"the main chat\", a nickname, or a voice-mode mistranscription actually maps to. " +
+        "Once a phrase is resolved to a channelId or userId, immediately `recall` again " +
+        "with that id as a filter to load every related note (style rules, in-jokes, " +
+        "topics in flight) before composing. Do this BEFORE `discord_dms` / " +
+        "`discord_guilds` / `discord_open` / `discord_send` — those are the fallback when " +
+        "no alias exists, not the first step.\n\n" +
+        "Each entry can be tagged with a `userId` and/or `channelId`. Many notes can share " +
+        "the same id — that is the point: tag every alias / style / friend / group note " +
+        "with the relevant ID so the filtered recall returns a tight slice instead of " +
+        "dumping the whole notebook.\n\n" +
+        "Actions:\n" +
+        "  `recall` (no filter) — every saved note grouped by topic. Cheap; do this first.\n" +
+        "  `recall` (with `key`) — one entry.\n" +
+        "  `recall` (with `userId` / `channelId` / `topic`) — entries matching ALL given " +
+        "filters. Use once the target id is known.\n" +
+        "  `save` — write/overwrite an entry. Use snake_case keys, optionally prefixed by " +
+        "type and sub-aspect (`friend:kavi`, `group:main`, `group:main:style`, " +
+        "`alias:my_group`, `pref:tone`). Multiple notes per channel/user is the normal " +
+        "case — keep each one short and durable, and reuse the same `channelId`/`userId` " +
+        "across them. Save a new alias note any time the user refers to something by a " +
+        "phrase you had to resolve manually — so next session is one recall away.\n" +
+        "  `forget` — delete one entry.",
+    inputSchema: {
+        action: z.enum(["save", "recall", "forget"]).describe("`save` writes/overwrites, `recall` reads, `forget` deletes."),
+        key: z.string().optional().describe("Entry key. Required for `save` / `forget`. On `recall`, fetches that single entry."),
+        value: z.string().optional().describe("Note content (free-form text). Required for `save`."),
+        topic: z.string().optional().describe(`Optional grouping bucket, e.g. "writing_style", "friends", "groups", "preferences". Default "general". Also acts as a filter on recall.`),
+        userId: z.string().optional().describe("Discord user ID to attach (on save) or filter by (on recall). Use to anchor a note to a specific person."),
+        channelId: z.string().optional().describe("Discord channel ID to attach (on save) or filter by (on recall). Use to anchor a note to a specific DM / group / channel."),
+        path: z.string().optional().describe("Override notes file path. Default is the bridge-local store; rarely needed."),
+    },
+}, async ({ action, key, value, topic, userId, channelId, path }) => {
+    const file = path || NOTES_PATH;
+
+    if (action === "save") {
+        if (!key || !key.trim()) return text("`key` is required for save.", true);
+        if (value === undefined) return text("`value` is required for save.", true);
+        const notes = readNotes(file);
+        notes[key] = {
+            value,
+            topic: topic || "general",
+            updated: new Date().toISOString(),
+            ...(userId ? { userId } : {}),
+            ...(channelId ? { channelId } : {}),
+        };
+        try { writeNotes(file, notes); }
+        catch (e) { return text("Failed to write notes: " + errMsg(e), true); }
+        const tags = [
+            `topic \`${notes[key].topic}\``,
+            userId ? `userId \`${userId}\`` : null,
+            channelId ? `channelId \`${channelId}\`` : null,
+        ].filter(Boolean).join(", ");
+        return text(`Saved \`${key}\` (${tags}).`);
+    }
+
+    if (action === "forget") {
+        if (!key || !key.trim()) return text("`key` is required for forget.", true);
+        const notes = readNotes(file);
+        if (!(key in notes)) return text(`No entry under \`${key}\`.`, true);
+        delete notes[key];
+        try { writeNotes(file, notes); }
+        catch (e) { return text("Failed to write notes: " + errMsg(e), true); }
+        return text(`Forgot \`${key}\`.`);
+    }
+
+    // recall
+    const notes = readNotes(file);
+
+    if (key) {
+        const e = notes[key];
+        if (!e) return text(`No entry under \`${key}\`.`);
+        return text(JSON.stringify(e, null, 2));
+    }
+
+    const hasFilter = !!(userId || channelId || topic);
+    if (hasFilter) {
+        const matches: Record<string, Partial<NoteEntry>> = {};
+        for (const [k, e] of Object.entries(notes)) {
+            if (userId && e.userId !== userId) continue;
+            if (channelId && e.channelId !== channelId) continue;
+            if (topic && (e.topic || "general") !== topic) continue;
+            matches[k] = compact({ value: e.value, topic: e.topic, userId: e.userId, channelId: e.channelId });
+        }
+        const n = Object.keys(matches).length;
+        if (!n) {
+            const filterDesc = [
+                userId ? `userId=${userId}` : null,
+                channelId ? `channelId=${channelId}` : null,
+                topic ? `topic=${topic}` : null,
+            ].filter(Boolean).join(", ");
+            return text(`(no entries match ${filterDesc})`);
+        }
+        return text(JSON.stringify(matches, null, 2));
+    }
+
+    const keys = Object.keys(notes);
+    if (!keys.length) return text("(no saved notes yet — use `save` to record one)");
+    const byTopic: Record<string, Record<string, Partial<NoteEntry>>> = {};
+    for (const k of keys) {
+        const e = notes[k];
+        const t = e.topic || "general";
+        (byTopic[t] ||= {})[k] = compact({ value: e.value, userId: e.userId, channelId: e.channelId });
+    }
+    return text(JSON.stringify(byTopic, null, 2));
+});
 
 mcp.registerTool("discord_status", {
     description:

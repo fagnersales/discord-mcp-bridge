@@ -117,6 +117,21 @@ press `Ctrl+R` — `discord_status` should then report the plugin connected.
 - `discord_reload()` — reload the renderer and wait until the bridge reconnects.
 - `discord_status()` — daemon up? plugin connected? + renderer liveness snapshot.
 
+### Memory — personal context across sessions
+
+- `discord_notes({action, key?, value?, topic?, userId?, channelId?})` —
+  a tiny persistent notebook so the agent can remember things about
+  *you* across sessions: writing style, recurring contacts, group
+  conventions, preferences. Actions are `save` / `recall` / `forget`.
+  Each note can be tagged with a `userId` and/or `channelId`, anchoring
+  it to a specific person / DM / channel — and many notes can share
+  the same id. `recall` with no filter dumps every saved note grouped
+  by topic (good at session start); `recall` with a `userId` /
+  `channelId` / `topic` filter returns just the matching slice, so
+  after resolving "main group" to a channelId the agent can pull
+  *only* the notes about that group. Stored locally as `notes.json`
+  next to the bridge; nothing leaves the machine.
+
 ## Example — "reply to Kavi based on what we've been talking about"
 
 ```text
