@@ -21,12 +21,14 @@ const HOST = "0.0.0.0";                       // reachable from Windows-side Dis
 const TOKEN = "vc-debug-bridge-2f9a4c1e";     // shared secret — must match the plugin
 const CALL_TIMEOUT_MS = 12_000;               // how long a tool call waits for a result
 const POLL_HOLD_MS = 25_000;                  // how long /poll is held open with no work
-const PLUGIN_STALE_MS = 40_000;               // no poll within this -> plugin "disconnected"
+const PLUGIN_STALE_MS = 15_000;               // no poll/heartbeat within this -> plugin "disconnected" (heartbeat = 5s, so 3 missed = stale)
+const DISCONNECT_LOG_LIMIT = 50;              // keep this many recent disconnect events in memory for /status
 const DEFAULT_DEPTH = 3;                      // result serialization depth when unspecified
 const RELOAD_DEADLINE_MS = 35_000;            // how long /reload waits for Discord to return
 const SCREENSHOT_TIMEOUT_MS = 30_000;         // capture + encode + transfer of a base64 image
 
 const LOG_FILE = new URL("./daemon.log", import.meta.url).pathname;
+const DISCONNECT_LOG_FILE = new URL("./disconnect.log", import.meta.url).pathname;
 const STARTED_AT = Date.now();
 
 function log(...a: unknown[]) {
@@ -45,6 +47,7 @@ interface BridgeReply { id: string; ok: boolean; result?: unknown; error?: strin
 let nextId = 1;
 let lastPollAt = 0;
 let pollSeq = 0;                                               // ++ on every /poll received
+let lastHeartbeatAt = 0;
 const commandQueue: Command[] = [];                            // queued, not yet polled
 const pollWaiters: Array<(cmd: Command | null) => void> = [];  // parked /poll requests
 const pending = new Map<string, {                              // tool calls awaiting a result
@@ -53,7 +56,27 @@ const pending = new Map<string, {                              // tool calls awa
     timer: ReturnType<typeof setTimeout>;
 }>();
 
-const pluginConnected = () => lastPollAt > 0 && Date.now() - lastPollAt < PLUGIN_STALE_MS;
+interface DisconnectEvent { ts: number; reason: string; details?: Record<string, unknown>; }
+const disconnectLog: DisconnectEvent[] = [];
+let lastDisconnect: DisconnectEvent | null = null;
+
+function recordDisconnect(reason: string, details?: Record<string, unknown>) {
+    const ev: DisconnectEvent = { ts: Date.now(), reason, details };
+    lastDisconnect = ev;
+    disconnectLog.push(ev);
+    if (disconnectLog.length > DISCONNECT_LOG_LIMIT) disconnectLog.shift();
+    try {
+        appendFileSync(DISCONNECT_LOG_FILE,
+            `[${new Date(ev.ts).toISOString()}] ${reason} ${JSON.stringify(details || {})}\n`);
+    } catch { /* */ }
+    log(`disconnect-reason: ${reason}`, details || {});
+}
+
+// "Live" means we heard from the plugin recently — via /poll OR /heartbeat.
+// Heartbeat is independent of the poll loop, so a wedged in-flight eval no
+// longer makes the plugin look disconnected; only true silence does.
+const lastSeenAt = () => Math.max(lastPollAt, lastHeartbeatAt);
+const pluginConnected = () => lastSeenAt() > 0 && Date.now() - lastSeenAt() < PLUGIN_STALE_MS;
 
 /** Hand a command to a parked poll if one is waiting, else queue it. */
 function deliver(cmd: Command) {
@@ -168,8 +191,12 @@ function statusSnapshot() {
         port: PORT,
         pluginConnected: pluginConnected(),
         lastPollAgeMs: lastPollAt ? Date.now() - lastPollAt : null,
+        lastHeartbeatAgeMs: lastHeartbeatAt ? Date.now() - lastHeartbeatAt : null,
         pendingCalls: pending.size,
         queuedCommands: commandQueue.length,
+        lastDisconnect: lastDisconnect
+            ? { ...lastDisconnect, ageMs: Date.now() - lastDisconnect.ts }
+            : null,
     };
 }
 
@@ -183,6 +210,24 @@ async function handleHttp(req: Request): Promise<Response> {
     if (req.method === "POST" && url.pathname === "/poll") {
         const cmd = await awaitCommand(req.signal);
         return cmd ? jsonCors(cmd) : new Response(null, { status: 204, headers: CORS });
+    }
+
+    // plugin pings here on its own timer, independent of the poll loop, so a
+    // wedged in-flight eval doesn't make the plugin look disconnected.
+    if (req.method === "POST" && url.pathname === "/heartbeat") {
+        lastHeartbeatAt = Date.now();
+        return textCors("ok");
+    }
+
+    // plugin reports a known failure cause (timeout, uncaught, rejection) here
+    // so /status surfaces a real reason instead of just "stale".
+    if (req.method === "POST" && url.pathname === "/disconnect-reason") {
+        let body: any;
+        try { body = JSON.parse(await req.text()); } catch { return textCors("bad json", 400); }
+        const reason = typeof body?.reason === "string" ? body.reason : "unspecified";
+        const { reason: _r, at: _at, ...details } = body || {};
+        recordDisconnect(reason, details);
+        return textCors("ok");
     }
 
     // plugin posts an eval result here

@@ -34,6 +34,9 @@ const BASES = ["http://localhost:8787", "http://127.0.0.1:8787"];
 const POLL_ABORT_MS = 35_000;                       // > the server's 25s long-poll hold
 const BACKOFF_MS = 2_000;                           // wait after a network error
 const CONSOLE_LIMIT = 200;
+const BUILD_TIMEOUT_MS = 15_000;                    // per-eval wall clock — > daemon CALL_TIMEOUT_MS (12s)
+const SCREENSHOT_BUILD_TIMEOUT_MS = 35_000;         // > daemon SCREENSHOT_TIMEOUT_MS (30s)
+const HEARTBEAT_MS = 5_000;                         // independent of the poll loop
 
 /**
  * Native (main-process) helpers — see native.ts. Vencord populates this at
@@ -72,6 +75,7 @@ let pollGen = 0;
 let baseIndex = 0;
 let connected = false;
 let currentAbort: AbortController | undefined;
+let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
 /**
  * `connected` changes outside React (in the poll loop). The toolbar icon needs
@@ -251,6 +255,21 @@ async function buildScreenshotReply(id: string, optsJson: string): Promise<strin
 
 /* ------------------------------------------------------- poll transport -- */
 
+/**
+ * Best-effort forensics: tell the daemon why we just had a problem, so the
+ * MCP side surfaces a real reason instead of "plugin not connected" after a
+ * 40s silence. Fire-and-forget — never block the poll loop.
+ */
+function reportDisconnect(reason: string, details?: Record<string, unknown>): void {
+    const base = BASES[baseIndex % BASES.length];
+    try {
+        void fetch(base + "/disconnect-reason?token=" + TOKEN, {
+            method: "POST",
+            body: JSON.stringify({ reason, at: Date.now(), ...(details || {}) }),
+        }).catch(() => { /* */ });
+    } catch { /* */ }
+}
+
 async function pollOnce(): Promise<void> {
     const base = BASES[baseIndex % BASES.length];
     const ctrl = new AbortController();
@@ -278,9 +297,43 @@ async function pollOnce(): Promise<void> {
     if (typeof cmd.id !== "string" || typeof cmd.code !== "string") return;
 
     const depth = typeof cmd.depth === "number" && cmd.depth > 0 ? cmd.depth : 8;
-    const payload = cmd.kind === "screenshot"
-        ? await buildScreenshotReply(cmd.id, cmd.code)
-        : await buildReply(cmd.id, cmd.code, depth);
+    const kind = cmd.kind === "screenshot" ? "screenshot" : "eval";
+    const timeoutMs = cmd.kind === "screenshot" ? SCREENSHOT_BUILD_TIMEOUT_MS : BUILD_TIMEOUT_MS;
+    const buildPromise = cmd.kind === "screenshot"
+        ? buildScreenshotReply(cmd.id, cmd.code)
+        : buildReply(cmd.id, cmd.code, depth);
+
+    // Race the build against a wall-clock timeout. A hung eval (e.g. the
+    // sendMessage wait-for-ready trap) used to wedge the entire poll loop —
+    // the daemon then went silent for ~40s with no recorded cause. Now we
+    // abandon the wedged promise, surface the timeout to the agent, and
+    // keep polling. The orphaned promise may still resolve later; its
+    // result is dropped because the command id was already replied to.
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const payload = await Promise.race<string>([
+        buildPromise,
+        new Promise<string>(resolve => {
+            timer = setTimeout(() => {
+                timedOut = true;
+                resolve(JSON.stringify({
+                    id: cmd.id,
+                    ok: false,
+                    error: `[discord-bridge] ${kind} exceeded ${timeoutMs}ms — plugin abandoned this call to keep polling. Likely a wait-for-ready or other unresolved promise.`,
+                }));
+            }, timeoutMs);
+        }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (timedOut) {
+        reportDisconnect("build-timeout", {
+            commandId: cmd.id,
+            kind,
+            timeoutMs,
+            codePreview: cmd.code.slice(0, 240),
+        });
+    }
+
     // No custom headers / plain-text body keeps this a "simple" CORS request (no preflight).
     try {
         await fetch(base + "/result?token=" + TOKEN, { method: "POST", body: payload });
@@ -301,6 +354,20 @@ async function pollLoop(gen: number): Promise<void> {
 /* ------------------------------------------------------ poll lifecycle -- */
 
 /**
+ * Independent liveness ping. Runs on its own timer so a wedged eval inside
+ * `pollOnce` no longer makes the plugin look dead to the daemon — the
+ * heartbeat keeps `lastPollAt` fresh while the poll loop is mid-call. The
+ * daemon bumps `lastPollAt` on this just like a real /poll.
+ */
+function sendHeartbeat(): void {
+    const base = BASES[baseIndex % BASES.length];
+    try {
+        void fetch(base + "/heartbeat?token=" + TOKEN, { method: "POST" })
+            .catch(() => { /* daemon down — the next /poll will fail the same way */ });
+    } catch { /* */ }
+}
+
+/**
  * Stop the long-poll loop and abort any in-flight request. Idempotent.
  * Bumping `pollGen` retires the running loop: it exits at its next check,
  * including mid-way through the post-error backoff sleep.
@@ -310,6 +377,7 @@ function stopPolling(): void {
     setConnected(false);
     try { currentAbort?.abort(); } catch { /* */ }
     currentAbort = undefined;
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = undefined; }
 }
 
 /**
@@ -323,6 +391,8 @@ function startPolling(): void {
     baseIndex = 0;
     setConnected(false);
     void pollLoop(gen);
+    sendHeartbeat();                                // prime immediately
+    heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_MS);
 }
 
 /** Bring the poll loop in line with the desired active state. */
@@ -355,8 +425,28 @@ function installConsoleCapture(): void {
             origConsole[level]!.apply(console, args);
         };
     });
-    onError = e => pushLog("uncaught", [e.message, (e.filename || "") + ":" + e.lineno, e.error]);
-    onRejection = e => pushLog("unhandledrejection", [e.reason]);
+    onError = e => {
+        pushLog("uncaught", [e.message, (e.filename || "") + ":" + e.lineno, e.error]);
+        if (!settings.store.bridgeActive) return;
+        const stack = (e.error && (e.error.stack || String(e.error))) || "";
+        reportDisconnect("uncaught-error", {
+            message: e.message,
+            filename: e.filename,
+            lineno: e.lineno,
+            colno: (e as any).colno,
+            stack: String(stack).slice(0, 4000),
+        });
+    };
+    onRejection = e => {
+        pushLog("unhandledrejection", [e.reason]);
+        if (!settings.store.bridgeActive) return;
+        const r: any = e.reason;
+        const stack = (r && (r.stack || r.message || String(r))) || "";
+        reportDisconnect("unhandled-rejection", {
+            message: r?.message || String(r),
+            stack: String(stack).slice(0, 4000),
+        });
+    };
     window.addEventListener("error", onError);
     window.addEventListener("unhandledrejection", onRejection);
 }
@@ -403,6 +493,7 @@ async function bridgeSendMessage(args: SendArgs): Promise<unknown> {
 
     const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
     const ChannelStore = W.findByProps("getChannel", "hasChannel");
+    const ChannelActions = W.findByProps("selectChannel", "selectVoiceChannel");
     const MessageActions = W.findByProps("sendMessage", "editMessage");
     const GuildStore = W.findByProps("getGuild", "getGuilds");
 
@@ -410,6 +501,19 @@ async function bridgeSendMessage(args: SendArgs): Promise<unknown> {
     if (!id) throw new Error("No channel selected and no channelId provided.");
     const channel = ChannelStore?.getChannel?.(id);
     if (!channel) throw new Error("Channel not found: " + id);
+
+    // Pre-flight: if the renderer is on a different channel, `sendMessage`'s
+    // wait-for-channel-ready can hang forever (Discord waits for the channel
+    // to open in the UI, but nothing here opens it). Select first; the send
+    // path also passes `false` below to belt-and-suspenders the wedge.
+    if (ChannelActions?.selectChannel && SelectedChannelStore?.getChannelId?.() !== id) {
+        ChannelActions.selectChannel({ guildId: channel.guild_id || null, channelId: id });
+        const deadline = Date.now() + 1500;
+        while (Date.now() < deadline) {
+            if (SelectedChannelStore?.getChannelId?.() === id) break;
+            await new Promise(r => setTimeout(r, 25));
+        }
+    }
 
     const channelInfo = {
         id,
@@ -504,7 +608,7 @@ async function bridgeSendMessage(args: SendArgs): Promise<unknown> {
             invalidEmojis: [],
             validNonShortcutEmojis: [],
             tts,
-        }, true, {
+        }, false, {
             attachmentsToUpload: uploads,
             ...(messageReference ? { messageReference } : {}),
         });
@@ -516,13 +620,15 @@ async function bridgeSendMessage(args: SendArgs): Promise<unknown> {
 
         // 4th arg is `options` — Discord reads `.nonce` off it unconditionally,
         // so must be an object (never undefined). 3rd arg is the
-        // "wait-for-channel-ready" boolean, default true.
+        // "wait-for-channel-ready" boolean — `false` here because we pre-select
+        // the channel above, and waiting can hang indefinitely if the channel
+        // is not loaded in the UI.
         await MessageActions.sendMessage(id, {
             content,
             invalidEmojis: [],
             validNonShortcutEmojis: [],
             tts,
-        }, true, messageReference ? { messageReference } : {});
+        }, false, messageReference ? { messageReference } : {});
     }
 
     return {
@@ -2167,7 +2273,22 @@ async function bridgeDmOpen(args: DmOpenArgs): Promise<unknown> {
 
     const UserStore = W.findByProps("getCurrentUser", "getUser");
     const RelationshipStore = W.findByProps("getRelationshipType", "isFriend");
+    const ChannelActions = W.findByProps("selectChannel", "selectVoiceChannel");
+    const SelectedChannelStore = W.findByProps("getChannelId", "getVoiceChannelId");
     const renderName = (u: any) => u?.global_name ?? u?.globalName ?? u?.username ?? null;
+
+    // Resolving the channel via REST is not enough — the agent's mental model
+    // of `dmOpen` is "navigate to this DM". Without selectChannel the renderer
+    // stays on the prior channel, and a follow-up `sendMessage` would have to
+    // pre-select itself. Do it here so the name matches the behavior.
+    if (ChannelActions?.selectChannel && SelectedChannelStore?.getChannelId?.() !== ch.id) {
+        ChannelActions.selectChannel({ guildId: null, channelId: ch.id });
+        const deadline = Date.now() + 1500;
+        while (Date.now() < deadline) {
+            if (SelectedChannelStore?.getChannelId?.() === ch.id) break;
+            await new Promise(r => setTimeout(r, 25));
+        }
+    }
 
     const recipients = (ch.recipients || []).map((u: any) => {
         const cached = UserStore?.getUser?.(u.id);
@@ -2637,7 +2758,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 24,
+            version: 25,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
