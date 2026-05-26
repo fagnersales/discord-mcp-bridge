@@ -1043,6 +1043,85 @@ mcp.registerTool("discord_wait", {
         (selector ? `selector ${selector}` : "expr") + (last ? ` (last: ${last})` : ""), true);
 });
 
+mcp.registerTool("discord_waitForMessage", {
+    description:
+        "Block until a new Discord message arrives that matches the filter — or until " +
+        "`timeoutMs` elapses. Subscribes inside the renderer to Discord's FluxDispatcher " +
+        "`MESSAGE_CREATE`, so this is event-driven (no history polling) and catches messages " +
+        "in DMs, group DMs, and guild channels alike. Filters AND together; omit a filter " +
+        "to match anything in that dimension (e.g. omit `channelId` to listen to every " +
+        "channel at once).\n\n" +
+        "USE WHEN the user says any of: \"wait for a message\", \"wait for a reply\", " +
+        "\"wait for his / her / their response\", \"wait until X responds / replies / " +
+        "messages me / says something\", \"respond when X messages me\", \"let me know when " +
+        "someone writes in this group\", \"watch this channel for a new message\", or any " +
+        "phrasing that means \"pause until a Discord message arrives\". Pick filters from " +
+        "the user's wording: a named person → resolve via `discord_notes` / `discord_dms` " +
+        "to a `fromUserId`; \"in this channel / group / DM\" → `channelId`; \"about X\" → " +
+        "`contains: \"X\"`; \"when they ping me\" → `mentionsViewer: true`. Default " +
+        "excludes the viewer's own outgoing messages — pass `includeSelf: true` only if " +
+        "the user explicitly wants their own sends. Optimistic pre-confirmation dispatches " +
+        "are always skipped.\n\n" +
+        "Result on hit: `{done: true, timedOut: false, matches: [<msg>...]}` where each " +
+        "`msg` is `{id, channelId, guildId, content, timestamp, author, attachments?, " +
+        "replyTo?, mentions?}`. On timeout: `{done: false, timedOut: true, matches: []}` " +
+        "(or partial matches if `maxMatches > 1`). After a hit, the typical follow-up is " +
+        "`discord_send({channelId, replyToMessageId, content})`.",
+    inputSchema: {
+        channelId: z.string().optional().describe("Restrict to one channel (DM, group, or guild channel). Omit to match in any channel."),
+        fromUserId: z.string().optional().describe("Only count messages whose author has this user ID."),
+        contains: z.string().optional().describe("Only count messages whose content contains this substring (case-insensitive)."),
+        mentionsViewer: z.boolean().optional().describe("Only count messages that mention the current user."),
+        includeSelf: z.boolean().optional().describe("Include the viewer's own (server-confirmed) outgoing messages. Default false."),
+        maxMatches: z.number().int().min(1).max(50).optional().describe("Resolve after collecting this many matches (default 1)."),
+        timeoutMs: z.number().int().min(1_000).max(600_000).optional().describe("Max wait in ms (default 60000, max 600000 = 10 min)."),
+    },
+}, async (args) => {
+    const armCode =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.waitArm)` +
+        `  ? globalThis.$discordBridge.waitArm(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DiscordMCP waitArm helper missing — plugin out of date; rebuild & redeploy.") })()`;
+
+    let arm: BridgeReply;
+    try { arm = await daemonEval(armCode, 4, 10_000); }
+    catch (e) { return text("Bridge error: " + errMsg(e), true); }
+    if (!arm.ok) return formatReply(arm);
+    const armed = arm.result as { waitId?: string; expiresInMs?: number };
+    if (!armed?.waitId)
+        return text("waitArm returned no waitId:\n" + JSON.stringify(armed, null, 2), true);
+
+    const waitId = armed.waitId;
+    const deadline = Date.now() + (armed.expiresInMs ?? 60_000) + 2_000;
+    const pollCode =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.waitPoll)` +
+        `  ? globalThis.$discordBridge.waitPoll(${JSON.stringify(waitId)})` +
+        `  : (() => { throw new Error("DiscordMCP waitPoll helper missing.") })()`;
+    const cancelCode =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.waitCancel)` +
+        `  ? globalThis.$discordBridge.waitCancel(${JSON.stringify(waitId)})` +
+        `  : null`;
+
+    while (Date.now() < deadline) {
+        let r: BridgeReply;
+        try { r = await daemonEval(pollCode, 6, 8_000); }
+        catch (e) {
+            try { await daemonEval(cancelCode, 2, 5_000); } catch { /* */ }
+            return text("Bridge error during wait: " + errMsg(e), true);
+        }
+        if (!r.ok) return formatReply(r);
+        const res = r.result as any;
+        if (res?.unknown)
+            return text(JSON.stringify({ done: false, timedOut: true, note: "wait already expired" }, null, 2));
+        if (res?.done || res?.timedOut)
+            return text(JSON.stringify(res, null, 2));
+        await sleep(500);
+    }
+
+    // safety net — renderer auto-cleans, but make it explicit
+    try { await daemonEval(cancelCode, 2, 5_000); } catch { /* */ }
+    return text(JSON.stringify({ done: false, timedOut: true, matches: [] }, null, 2));
+});
+
 /** Summarize the tail of perf.log per tool — count / p50 / p95 / errors. */
 function perfSummary(tailLines = 200): string {
     let raw: string;

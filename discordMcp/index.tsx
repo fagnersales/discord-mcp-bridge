@@ -2658,6 +2658,170 @@ async function bridgeOrganizeGuilds(args: OrganizeArgs): Promise<unknown> {
     };
 }
 
+/* ---------------------------------------------------- wait for messages -- */
+
+/**
+ * `$discordBridge.waitArm` / `waitPoll` / `waitCancel` — the renderer half of
+ * the `discord_waitForMessage` MCP tool. Plugin eval wall-clock is 15s
+ * (`BUILD_TIMEOUT_MS`), so we cannot hold a single eval open for a 60s+ wait.
+ * Pattern: `waitArm` subscribes to FluxDispatcher MESSAGE_CREATE synchronously
+ * and returns a `waitId`; the MCP side polls `waitPoll` until matches arrive
+ * or the deadline elapses. Auto-unsubscribes on match-cap reached, on poll
+ * after the deadline, or after `timeoutMs + 1s` (renderer-side safety net,
+ * so a dropped MCP loop never leaks a subscription).
+ */
+interface WaitSpec {
+    channelId?: string;
+    fromUserId?: string;
+    contains?: string;
+    mentionsViewer?: boolean;
+    includeSelf?: boolean;
+    maxMatches?: number;
+    timeoutMs?: number;
+}
+
+interface WaitEntry {
+    matches: unknown[];
+    cap: number;
+    expiresAt: number;
+    expireTimer: ReturnType<typeof setTimeout>;
+    unsubscribe: () => void;
+}
+
+const activeWaits = new Map<string, WaitEntry>();
+
+/** Slim projection of a MESSAGE_CREATE payload — same shape vocab as `getView`. */
+function projectIncomingMessage(msg: any): any {
+    const renderName = (u: any) => u?.globalName ?? u?.global_name ?? u?.username ?? null;
+    const ts = msg.timestamp;
+    const out: any = {
+        id: msg.id,
+        channelId: msg.channel_id ?? msg.channelId,
+        guildId: msg.guild_id ?? msg.guildId ?? null,
+        content: msg.content || "",
+        timestamp: typeof ts === "string" ? ts
+            : (typeof ts?.toISOString === "function" ? ts.toISOString() : null),
+        author: msg.author ? {
+            id: msg.author.id,
+            username: msg.author.username,
+            name: renderName(msg.author),
+            bot: !!msg.author.bot,
+        } : null,
+    };
+    if (msg.attachments?.length) {
+        out.attachments = msg.attachments.map((a: any) => ({
+            name: a.filename || a.name,
+            url: a.url,
+            contentType: a.content_type || a.contentType,
+            size: a.size,
+        }));
+    }
+    const refId = msg.message_reference?.message_id
+        ?? msg.messageReference?.message_id
+        ?? msg.referenced_message?.id;
+    if (refId) out.replyTo = { id: refId };
+    if (msg.mentions?.length) {
+        out.mentions = msg.mentions.map((m: any) =>
+            typeof m === "string" ? { id: m } : { id: m.id, name: renderName(m) });
+    }
+    if (msg.mention_everyone || msg.mentionEveryone) out.mentionEveryone = true;
+    return out;
+}
+
+function bridgeWaitArm(spec: WaitSpec = {}): unknown {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+    const FluxDispatcher = W.findByProps("dispatch", "subscribe");
+    if (!FluxDispatcher?.subscribe || !FluxDispatcher?.unsubscribe)
+        throw new Error("FluxDispatcher (dispatch/subscribe) not found.");
+    const UserStore = W.findByProps("getCurrentUser", "getUser");
+    const viewerId: string | undefined = UserStore?.getCurrentUser?.()?.id;
+
+    const timeoutMs = Math.max(1_000, Math.min(600_000, spec.timeoutMs ?? 60_000));
+    const cap = Math.max(1, Math.min(50, spec.maxMatches ?? 1));
+    const expiresAt = Date.now() + timeoutMs;
+    const containsLc = spec.contains ? spec.contains.toLowerCase() : null;
+
+    const waitId = "w" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const matches: unknown[] = [];
+
+    const handler = (payload: any) => {
+        try {
+            // Skip optimistic dispatches — those fire BEFORE the server confirms
+            // the send, so they would double-emit and lie about delivery.
+            if (payload?.optimistic) return;
+            const msg = payload?.message;
+            if (!msg) return;
+            const channelId = msg.channel_id ?? msg.channelId;
+            const authorId: string | undefined = msg.author?.id;
+            if (spec.channelId && channelId !== spec.channelId) return;
+            if (spec.fromUserId && authorId !== spec.fromUserId) return;
+            if (!spec.includeSelf && viewerId && authorId === viewerId) return;
+            if (containsLc && !((msg.content || "").toLowerCase().includes(containsLc))) return;
+            if (spec.mentionsViewer && viewerId) {
+                const mentioned = Array.isArray(msg.mentions) && msg.mentions.some((m: any) =>
+                    (typeof m === "string" ? m : m?.id) === viewerId);
+                if (!mentioned) return;
+            }
+            matches.push(projectIncomingMessage(msg));
+            if (matches.length >= cap) cleanup();
+        } catch { /* never let a malformed dispatch nuke the subscription */ }
+    };
+
+    let subscribed = true;
+    const cleanup = () => {
+        if (!subscribed) return;
+        subscribed = false;
+        try { FluxDispatcher.unsubscribe("MESSAGE_CREATE", handler); } catch { /* */ }
+    };
+
+    FluxDispatcher.subscribe("MESSAGE_CREATE", handler);
+    const expireTimer = setTimeout(cleanup, timeoutMs + 1_000);
+    activeWaits.set(waitId, { matches, cap, expiresAt, expireTimer, unsubscribe: cleanup });
+
+    return { waitId, expiresAt, expiresInMs: timeoutMs };
+}
+
+function bridgeWaitPoll(waitId: string): unknown {
+    const entry = activeWaits.get(waitId);
+    if (!entry) return { unknown: true };
+    const now = Date.now();
+    const filled = entry.matches.length >= entry.cap;
+    const expired = now >= entry.expiresAt;
+    if (filled || expired) {
+        entry.unsubscribe();
+        clearTimeout(entry.expireTimer);
+        activeWaits.delete(waitId);
+        return {
+            done: entry.matches.length > 0,
+            timedOut: !filled && expired,
+            matches: entry.matches,
+        };
+    }
+    return {
+        done: false,
+        matchesSoFar: entry.matches.length,
+        expiresInMs: entry.expiresAt - now,
+    };
+}
+
+function bridgeWaitCancel(waitId: string): unknown {
+    const entry = activeWaits.get(waitId);
+    if (!entry) return { unknown: true };
+    entry.unsubscribe();
+    clearTimeout(entry.expireTimer);
+    activeWaits.delete(waitId);
+    return { cancelled: true, matches: entry.matches };
+}
+
+function clearAllWaits(): void {
+    for (const e of activeWaits.values()) {
+        try { e.unsubscribe(); } catch { /* */ }
+        clearTimeout(e.expireTimer);
+    }
+    activeWaits.clear();
+}
+
 /* -------------------------------------------------------- toolbar icon -- */
 
 /** Discord's header-bar icon button — the inbox / help cluster, top right. */
@@ -2758,7 +2922,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 25,
+            version: 26,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
@@ -2783,6 +2947,9 @@ export default definePlugin({
             ack: bridgeAck,
             listGuilds: bridgeListGuilds,
             organizeGuilds: bridgeOrganizeGuilds,
+            waitArm: bridgeWaitArm,
+            waitPoll: bridgeWaitPoll,
+            waitCancel: bridgeWaitCancel,
         };
         // Resume whatever state the toolbar icon was left in last session.
         if (settings.store.bridgeActive) startPolling();
@@ -2791,6 +2958,7 @@ export default definePlugin({
     stop() {
         stopPolling();
         removeConsoleCapture();
+        clearAllWaits();
         delete (globalThis as any).$discordBridge;
     },
 });

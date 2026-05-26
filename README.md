@@ -86,6 +86,17 @@ press `Ctrl+R` — `discord_status` should then report the plugin connected.
   `color` is a 24-bit RGB integer (the Discord folder swatch). A separate
   `orphans` array lists guilds the user is in but not referenced by any
   entry (Discord parks newly-joined guilds there).
+- `discord_waitForMessage({channelId?, fromUserId?, contains?, mentionsViewer?, includeSelf?, maxMatches?, timeoutMs?})`
+  — block until a new Discord message arrives that matches the filter (or until
+  `timeoutMs` elapses, default 60 s, max 10 min). Subscribes inside the renderer
+  to FluxDispatcher `MESSAGE_CREATE` — event-driven, no history polling.
+  Catches messages in DMs, group DMs, and guild channels alike. Filters AND
+  together; omit a filter to match anything in that dimension. Triggers on
+  phrases like *"wait for a message"*, *"wait for his/her response"*,
+  *"respond when X messages me"*, *"let me know when someone writes in this
+  group"*. Default skips the viewer's own outgoing messages
+  (`includeSelf: true` to include server-confirmed self-sends). Returns
+  `{done, timedOut, matches: [{id, channelId, content, timestamp, author, …}]}`.
 - `discord_organize({sidebar, apply?})` — rewrite the sidebar layout: reorder,
   group into folders, rename / recolor folders, ungroup, move guilds between
   folders. `sidebar` is the full ordered list of top-level entries; every
@@ -142,6 +153,22 @@ discord_send({                          → reply, with a natural typing pause
   channelId, content: "...",
   replyToMessageId: "...",
   typing: true,
+})
+```
+
+## Example — "wait for Kavi's response, then reply"
+
+```text
+discord_dms({ query: "kavi" })          → resolve channelId + userId
+discord_waitForMessage({                → blocks until Kavi sends a message
+  channelId, fromUserId,
+  timeoutMs: 300_000,                   // 5 min
+})
+                                        → { matches: [{ id, content, … }] }
+discord_send({                          → reply to that specific message
+  channelId,
+  replyToMessageId: matches[0].id,
+  content: "...",
 })
 ```
 
