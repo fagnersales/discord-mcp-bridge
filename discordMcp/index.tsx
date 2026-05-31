@@ -2658,6 +2658,132 @@ async function bridgeOrganizeGuilds(args: OrganizeArgs): Promise<unknown> {
     };
 }
 
+/* ------------------------------------------------------------ join invite -- */
+
+/** Pull the invite code out of any of the forms a user might paste. */
+function parseInviteCode(raw: string): string {
+    let s = String(raw ?? "").trim();
+    if (!s) throw new Error("Empty invite — pass an invite URL or code.");
+    // Strip a leading scheme so URL() isn't required, then peel the code.
+    const m = s.match(/(?:discord\.gg|discord(?:app)?\.com\/invite|invite)\/([^/?#\s]+)/i);
+    if (m) s = m[1];
+    // Drop any leftover query/hash/path on a bare code.
+    s = s.split(/[?#/]/)[0].trim();
+    if (!s) throw new Error(`Could not parse an invite code from: ${raw}`);
+    return s;
+}
+
+interface JoinInviteArgs { invite: string; apply?: boolean; }
+
+/**
+ * Resolve a Discord invite and (optionally) join the guild behind it.
+ *
+ * Dry-run by default: resolves the invite and reports the guild/channel it
+ * points at without joining. Pass `apply: true` to actually accept the invite
+ * via `InviteActions.acceptInvite`. Idempotent — if the user is already in the
+ * target guild, returns `alreadyMember: true` without re-accepting.
+ */
+async function bridgeJoinInvite(args: JoinInviteArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+    const code = parseInviteCode(args?.invite);
+    const InviteActions = W.findByProps("acceptInvite", "resolveInvite");
+    if (!InviteActions?.resolveInvite || !InviteActions?.acceptInvite)
+        throw new Error("InviteActions module not found — webpack module shape may have changed.");
+    const GuildStore = W.findByProps("getGuild", "getGuilds");
+
+    const resolved = await InviteActions.resolveInvite(code, "Join Guild");
+    const invite = resolved?.invite;
+    if (!invite)
+        return { joined: false, code, error: "Invite is invalid, expired, or revoked." };
+
+    const guild = invite.guild ?? null;
+    const preview = {
+        code,
+        guild: guild ? { id: guild.id, name: guild.name } : null,
+        channel: invite.channel ? { id: invite.channel.id, name: invite.channel.name } : null,
+        approxMembers: invite.approximate_member_count ?? null,
+        approxOnline: invite.approximate_presence_count ?? null,
+        inviter: invite.inviter ? { id: invite.inviter.id, username: invite.inviter.username } : null,
+    };
+
+    // Already a member? Don't re-accept — just report it.
+    if (guild && GuildStore?.getGuild?.(guild.id))
+        return { joined: false, alreadyMember: true, ...preview };
+
+    if (!args?.apply)
+        return {
+            joined: false,
+            dryRun: true,
+            note: "Dry run — invite resolved but not joined. Pass `apply: true` to join.",
+            ...preview,
+        };
+
+    // Accept the invite. acceptInvite reads `context.invite_instance_id`, so the
+    // context object must exist; `location` mirrors a normal in-app join.
+    // IMPORTANT: do NOT await this. Discord gates joins on large/flagged guilds
+    // behind a cross-origin hCaptcha iframe, and acceptInvite's promise then
+    // stays pending until a human solves the captcha — awaiting it here would
+    // wedge the whole eval past the 15s plugin budget. Fire it, stash the
+    // outcome, and poll the store for a bounded window instead.
+    const targetId = guild?.id;
+    let acceptError: string | null = null;
+    InviteActions.acceptInvite({ inviteKey: code, context: { location: "Join Guild" } })
+        .catch((e: any) => { acceptError = String(e?.message || e); });
+
+    // Poll the store for ~6s (within the 15s eval budget). A captcha-gated join
+    // won't land in this window — we detect that by the hCaptcha iframe and
+    // report it cleanly. The fired acceptInvite stays pending in the renderer
+    // through the captcha, so a later solve (by the user or a configured hook)
+    // completes the join out-of-band; the MCP side then re-verifies membership.
+    let memberNow = false;
+    for (let i = 0; i < 30; i++) {
+        if (targetId && GuildStore?.getGuild?.(targetId)) { memberNow = true; break; }
+        if (acceptError) break;
+        await new Promise(r => setTimeout(r, 200));
+    }
+
+    const captchaUp = !memberNow && isCaptchaShowing();
+
+    if (memberNow) return { joined: true, ...preview };
+    if (captchaUp) return {
+        joined: false,
+        captchaRequired: true,
+        ...preview,
+        note: "Discord is gating this join behind a captcha challenge (shown in the Discord " +
+            "window). The captcha lives in a cross-origin anti-bot iframe the bridge cannot " +
+            "reach, so it must be solved at the OS level — by a human, or by a configured " +
+            "captcha-solver task. Once solved, the pending join completes automatically.",
+    };
+    if (acceptError) return { joined: false, error: acceptError, ...preview };
+    return {
+        joined: false,
+        ...preview,
+        note: "Invite accepted but guild not yet visible — it may still be loading, or " +
+            "onboarding/rules may be gating entry. Re-check membership shortly.",
+    };
+}
+
+/** True while a captcha challenge iframe is mounted in the renderer. */
+function isCaptchaShowing(): boolean {
+    return !!document.querySelector('iframe[src*="hcaptcha.com"], iframe[src*="captcha"]');
+}
+
+/**
+ * Cheap membership probe for the MCP side to poll after a captcha solve —
+ * avoids re-resolving the invite (a network round-trip) just to re-check.
+ * Also reports whether a captcha is still on screen, so the caller can tell
+ * "solved, still joining" from "captcha never got solved".
+ */
+function bridgeGuildMember(guildId: string): unknown {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+    const GuildStore = W.findByProps("getGuild", "getGuilds");
+    const g = guildId ? GuildStore?.getGuild?.(guildId) : null;
+    return { member: !!g, name: g?.name ?? null, captchaShowing: isCaptchaShowing() };
+}
+
 /* ---------------------------------------------------- wait for messages -- */
 
 /**
@@ -2922,7 +3048,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 26,
+            version: 28,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
@@ -2947,6 +3073,8 @@ export default definePlugin({
             ack: bridgeAck,
             listGuilds: bridgeListGuilds,
             organizeGuilds: bridgeOrganizeGuilds,
+            joinInvite: bridgeJoinInvite,
+            guildMember: bridgeGuildMember,
             waitArm: bridgeWaitArm,
             waitPoll: bridgeWaitPoll,
             waitCancel: bridgeWaitCancel,

@@ -109,6 +109,44 @@ press `Ctrl+R` — `discord_status` should then report the plugin connected.
   settings proto (syncs to the user's other Discord clients). The tool rejects
   unknown guildIds — strip "ghost" entries (left guilds still in proto) before
   retrying; append new joins (`orphans`) explicitly so they aren't dropped.
+- `discord_join({invite, apply?})` — join a server from an invite (full URL or
+  bare code). **Default is dry-run** — resolves the invite and returns the
+  target guild / channel / inviter / member counts without joining. Pass
+  `apply: true` to join. Idempotent (`alreadyMember: true` if already in). The
+  returned `joined` boolean reflects the **live guild store**, not a guess.
+  Large/flagged servers gate joins behind a captcha the bridge can't solve
+  (cross-origin anti-bot iframe) — see *Captcha* below.
+
+### Config
+
+- `discord_config({captchaCommand?, captchaTimeoutMs?, clearCaptcha?})` — read
+  (no args) or update the config file at
+  `~/.config/discord-mcp-bridge/config.json`. Currently holds the captcha
+  solver hook.
+
+#### Captcha
+
+When `discord_join({apply:true})` hits a captcha, the bridge itself does **not**
+click anything — it has no mouse/screen code and is OS-agnostic. Instead:
+
+1. It detects the captcha and returns `captchaRequired: true`.
+2. If a `captchaCommand` is configured, it shells out to that command, waits,
+   then re-reads the guild store and reports the real `joined`.
+3. With no command configured, it returns setup instructions — a human can
+   solve the captcha in the Discord window, then re-run `discord_join` to
+   confirm.
+
+The command is **user-supplied and platform-specific** — it must locate and
+solve the on-screen captcha itself (it gets `CAPTCHA_GUILD_ID` /
+`CAPTCHA_GUILD_NAME` / `CAPTCHA_INVITE` in env + the same JSON on stdin, but
+**no pixel coordinates** — those would break across resolutions / window
+positions). Exit 0 once solved. A reference Windows solver (Interception-driver
+mouse + RapidOCR checkbox locate) lives in
+[`examples/solve-captcha.windows.ts`](examples/solve-captcha.windows.ts).
+Note: auto-solving a captcha defeats Discord's anti-bot control — it is
+inherently unreliable (works on a low-risk session, refused once flagged) and
+carries account risk. The bridge falls back to a human cleanly rather than
+faking success.
 
 ### Inspection — debug Discord
 

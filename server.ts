@@ -19,8 +19,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { appendFileSync, readFileSync, writeFileSync } from "fs";
-import { basename, extname } from "path";
+import { appendFileSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { basename, extname, dirname, join } from "path";
+import { homedir } from "os";
 
 const PORT = 8787;
 const TOKEN = "vc-debug-bridge-2f9a4c1e";
@@ -28,6 +29,47 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const DAEMON_PATH = new URL("./daemon.ts", import.meta.url).pathname;
 const PERF_LOG = new URL("./perf.log", import.meta.url).pathname;
 const NOTES_PATH = new URL("./notes.json", import.meta.url).pathname;
+
+/**
+ * User config lives in a plain JSON file so it persists across sessions and the
+ * agent can read/write it on the user's behalf (see the `discord_config` tool).
+ * Honours $XDG_CONFIG_HOME, else ~/.config.
+ */
+const CONFIG_DIR = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "discord-mcp-bridge");
+const CONFIG_PATH = join(CONFIG_DIR, "config.json");
+
+interface BridgeConfig {
+    /** Captcha solver — invoked when a join is gated behind a captcha. */
+    captcha?: {
+        /**
+         * Shell command run to solve an on-screen captcha. Platform-specific and
+         * user-supplied — the bridge ships none. It receives context on stdin as
+         * JSON and via env vars (CAPTCHA_GUILD_ID, CAPTCHA_GUILD_NAME,
+         * CAPTCHA_INVITE). It must locate and solve the captcha itself (e.g. via
+         * screen capture + OCR/vision) — no pixel coordinates are passed, since
+         * the captcha's on-screen position varies with resolution and window
+         * placement. Exit 0 once solved.
+         */
+        command?: string;
+        /** Max time to let the solver run, ms (default 90000). */
+        timeoutMs?: number;
+    };
+}
+
+function loadConfig(): BridgeConfig {
+    try {
+        if (!existsSync(CONFIG_PATH)) return {};
+        return JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as BridgeConfig;
+    } catch (e) {
+        log("config load failed (" + CONFIG_PATH + "): " + errMsg(e));
+        return {};
+    }
+}
+
+function saveConfig(cfg: BridgeConfig): void {
+    if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+    writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n");
+}
 
 const log = (...a: unknown[]) => console.error("[discord-bridge-mcp]", ...a);
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -992,6 +1034,172 @@ mcp.registerTool("discord_organize", {
         `  ? globalThis.$discordBridge.organizeGuilds(${JSON.stringify(args)})` +
         `  : (() => { throw new Error("DiscordMCP organizeGuilds helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 6, 30_000);
+});
+
+/** Build a guarded `$discordBridge.<method>(arg)` expression for the renderer. */
+const bridgeCall = (method: string, arg?: unknown) =>
+    `(globalThis.$discordBridge && globalThis.$discordBridge.${method})` +
+    `  ? globalThis.$discordBridge.${method}(${arg === undefined ? "" : JSON.stringify(arg)})` +
+    `  : (() => { throw new Error("DiscordMCP ${method} helper missing — plugin out of date; rebuild & redeploy.") })()`;
+
+/** Eval a bridge helper and return its structured result (throws on renderer error). */
+async function callBridge(expr: string, depth = 6, timeoutMs = 20_000): Promise<any> {
+    const reply = await daemonEval(expr, depth, timeoutMs);
+    if (!reply.ok) throw new Error(reply.error ?? "renderer error");
+    return reply.result;
+}
+
+/**
+ * Run the user-configured captcha solver. It gets context via env + JSON stdin
+ * but NO pixel coordinates — the solver must locate the captcha on screen
+ * itself, so it stays correct across resolutions / window positions / OSes.
+ */
+async function runCaptchaHook(
+    command: string,
+    ctx: { guildId?: string; guildName?: string; invite: string },
+    timeoutMs: number,
+): Promise<{ ok: boolean; timedOut: boolean; exitCode: number | null; stderr: string }> {
+    const proc = Bun.spawn(["bash", "-lc", command], {
+        env: {
+            ...process.env,
+            CAPTCHA_GUILD_ID: ctx.guildId ?? "",
+            CAPTCHA_GUILD_NAME: ctx.guildName ?? "",
+            CAPTCHA_INVITE: ctx.invite,
+        },
+        stdin: new TextEncoder().encode(JSON.stringify(ctx)),
+        stdout: "pipe",
+        stderr: "pipe",
+    });
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; try { proc.kill(); } catch { /* already gone */ } }, timeoutMs);
+    const exitCode = await proc.exited;
+    clearTimeout(timer);
+    let stderr = "";
+    try { stderr = (await new Response(proc.stderr).text()).slice(0, 2000); } catch { /* ignore */ }
+    return { ok: !timedOut && exitCode === 0, timedOut, exitCode, stderr };
+}
+
+mcp.registerTool("discord_join", {
+    description:
+        "Join a Discord server from an invite. Accepts any invite form — a full URL " +
+        "(`https://discord.gg/abc`, `https://discord.com/invite/abc`) or a bare code (`abc`). " +
+        "Default is dry-run: resolves the invite and returns the target guild, channel, " +
+        "inviter, and approximate member/online counts WITHOUT joining. Pass `apply: true` to " +
+        "actually join. Idempotent — if the user is already in the guild it returns " +
+        "`alreadyMember: true` without re-accepting.\n\n" +
+        "ALWAYS check the returned `joined` boolean — it reflects the live guild store, not a " +
+        "guess. Possible outcomes: `joined:true` (in the guild), `alreadyMember:true`, " +
+        "`dryRun:true` (preview only), `captchaRequired:true`, or `error`.\n\n" +
+        "CAPTCHA: large/flagged servers gate joins behind a captcha the bridge cannot solve " +
+        "(cross-origin anti-bot iframe). If a captcha solver is configured (see " +
+        "`discord_config`), this tool runs it, then re-verifies membership and reports the real " +
+        "`joined` result. If none is configured, it returns `captchaRequired` with setup " +
+        "instructions — a human can solve the captcha in the Discord window, then re-run this " +
+        "tool with the same invite to confirm.",
+    inputSchema: {
+        invite: z.string().describe("Invite URL or bare code, e.g. `discord.gg/abc` or `abc`."),
+        apply: z.boolean().optional().describe("Default false (dry-run preview). Pass true to actually join."),
+    },
+}, async ({ invite, apply }) => {
+    let result: any;
+    try { result = await callBridge(bridgeCall("joinInvite", { invite, apply }), 6, 20_000); }
+    catch (e) { return text("Discord renderer error:\n" + errMsg(e), true); }
+
+    // Captcha gate only matters on a real join attempt.
+    if (apply && result?.captchaRequired) {
+        const cfg = loadConfig();
+        const command = cfg.captcha?.command;
+        const guildId: string | undefined = result?.guild?.id;
+        const guildName: string | undefined = result?.guild?.name;
+
+        if (!command) {
+            return text(JSON.stringify({
+                ...result,
+                captchaSolver: "not configured",
+                howToConfigure:
+                    "A captcha is blocking this join. Either: (a) a human solves the captcha in " +
+                    "the Discord window now, then re-run `discord_join` with the same invite to " +
+                    "confirm; or (b) configure an automatic solver via the `discord_config` tool " +
+                    "(`captchaCommand`) — a shell command for your OS that finds and solves the " +
+                    "on-screen captcha. Config file: " + CONFIG_PATH,
+            }, null, 2));
+        }
+
+        // Run the configured solver, then verify membership from the live store.
+        const timeoutMs = cfg.captcha?.timeoutMs ?? 90_000;
+        const hook = await runCaptchaHook(command, { guildId, guildName, invite }, timeoutMs);
+
+        let member: any = null;
+        const deadline = Date.now() + 15_000;
+        while (Date.now() < deadline) {
+            try { if (guildId) member = await callBridge(bridgeCall("guildMember", guildId), 3, 6_000); }
+            catch { /* keep polling */ }
+            if (member?.member) break;
+            await sleep(500);
+        }
+
+        const joined = !!member?.member;
+        return text(JSON.stringify({
+            joined,
+            guild: result.guild,
+            channel: result.channel,
+            captchaSolver: {
+                ran: true, ok: hook.ok, timedOut: hook.timedOut, exitCode: hook.exitCode,
+                ...(hook.stderr ? { stderr: hook.stderr } : {}),
+            },
+            captchaStillShowing: member?.captchaShowing ?? null,
+            note: joined
+                ? "Captcha solved and join confirmed."
+                : hook.ok
+                    ? "Solver exited cleanly but membership not yet confirmed — the guild may still " +
+                      "be settling, or onboarding/rules gate entry. Re-run to re-check."
+                    : "Solver did not complete the captcha (" +
+                      (hook.timedOut ? "timed out" : "exit " + hook.exitCode) +
+                      "). A human can solve it in the Discord window, then re-run to confirm.",
+        }, null, 2), !joined);
+    }
+
+    return text(JSON.stringify(result, null, 2), !!result?.error);
+});
+
+mcp.registerTool("discord_config", {
+    description:
+        "Read or update the discord-bridge config file. Call with NO args to read the current " +
+        "config, its path, and the schema. Pass fields to update them (the file is created if " +
+        "absent).\n\n" +
+        "The main setting is the captcha solver: `captchaCommand` is a shell command run when a " +
+        "`discord_join` is blocked by a captcha. It must locate and solve the on-screen captcha " +
+        "itself — NO pixel coordinates are passed (they'd break across resolutions / window " +
+        "positions). It receives context via env vars `CAPTCHA_GUILD_ID`, `CAPTCHA_GUILD_NAME`, " +
+        "`CAPTCHA_INVITE` and the same JSON on stdin; it should exit 0 once the captcha is " +
+        "solved. The command is platform-specific and entirely user-supplied — e.g. a script " +
+        "that screenshots, finds the 'I am human' checkbox, and clicks it (Windows: an " +
+        "Interception-driver mouse; macOS: `cliclick`; Linux: `ydotool`/`xdotool`).",
+    inputSchema: {
+        captchaCommand: z.string().optional().describe("Shell command to solve an on-screen captcha. Exit 0 when solved."),
+        captchaTimeoutMs: z.number().int().min(1000).optional().describe("Max solver runtime in ms (default 90000)."),
+        clearCaptcha: z.boolean().optional().describe("Remove the configured captcha solver."),
+    },
+}, async ({ captchaCommand, captchaTimeoutMs, clearCaptcha }) => {
+    const cfg = loadConfig();
+    let updated = false;
+    if (clearCaptcha) {
+        if (cfg.captcha) { delete cfg.captcha; updated = true; }
+    } else {
+        if (captchaCommand !== undefined) { (cfg.captcha ??= {}).command = captchaCommand; updated = true; }
+        if (captchaTimeoutMs !== undefined) { (cfg.captcha ??= {}).timeoutMs = captchaTimeoutMs; updated = true; }
+    }
+    if (updated) saveConfig(cfg);
+    return text(JSON.stringify({
+        path: CONFIG_PATH,
+        updated,
+        config: cfg,
+        schema: {
+            "captcha.command": "shell command run to solve an on-screen captcha (exit 0 when solved); " +
+                "gets CAPTCHA_GUILD_ID / CAPTCHA_GUILD_NAME / CAPTCHA_INVITE in env + JSON on stdin; no coordinates",
+            "captcha.timeoutMs": "max solver runtime in ms (default 90000)",
+        },
+    }, null, 2));
 });
 
 mcp.registerTool("discord_reload", {

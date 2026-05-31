@@ -4,3 +4,4 @@ daemon.log
 *.bak
 .DS_Store
 notes.json
+.captcha-shot.png
