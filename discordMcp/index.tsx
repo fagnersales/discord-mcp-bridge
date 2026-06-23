@@ -1383,7 +1383,7 @@ async function bridgeUserMessages(args: UserMessagesArgs): Promise<unknown> {
         query: args.query?.trim() || null,
         limit,
         offset: startOffset,
-        nextOffset: startOffset + collected.length < totalResults ? offset : null,
+        nextOffset: startOffset + collected.length < totalResults ? startOffset + collected.length : null,
         hasMore: startOffset + collected.length < totalResults,
         totalResults,
         count: collected.length,

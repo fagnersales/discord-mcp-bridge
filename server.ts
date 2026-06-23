@@ -1054,6 +1054,8 @@ mcp.registerTool("discord_mute_guild", {
             const GuildStore = W.findByProps("getGuild", "getGuilds");
             const SettingsStore = W.findByProps("isMuted", "getMuteConfig");
             const Actions = W.findByProps("updateGuildNotificationSettings", "updateChannelOverrideSettings");
+            if (!SettingsStore?.isMuted)
+                throw new Error("Mute-state store not found - webpack module shape may have changed.");
             const guild = GuildStore?.getGuild?.(guildId);
             const durationSeconds = {
                 "15m": 15 * 60,
