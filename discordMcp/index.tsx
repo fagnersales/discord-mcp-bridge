@@ -1294,6 +1294,105 @@ async function bridgeSearchMessages(args: SearchArgs): Promise<unknown> {
     };
 }
 
+interface UserMessagesArgs {
+    guildId: string;
+    userId: string;
+    query?: string;
+    before?: string;
+    after?: string;
+    offset?: number;
+    limit?: number;
+}
+
+/**
+ * Search a guild for messages by a specific author. This intentionally uses a
+ * bounded page shape instead of trying to dump an unbounded server history.
+ */
+async function bridgeUserMessages(args: UserMessagesArgs): Promise<unknown> {
+    const W = (globalThis as any).Vencord?.Webpack;
+    if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+    if (!/^\d{15,25}$/.test(args.guildId || "")) throw new Error("`guildId` must be a Discord snowflake.");
+    if (!/^\d{15,25}$/.test(args.userId || "")) throw new Error("`userId` must be a Discord snowflake.");
+
+    const GuildStore = W.findByProps("getGuild", "getGuilds");
+    const guild = GuildStore?.getGuild?.(args.guildId);
+    const token = getAuthToken(W);
+    const limit = Math.max(1, Math.min(500, args.limit ?? 100));
+    const startOffset = Math.max(0, args.offset ?? 0);
+
+    const base = `https://discord.com/api/v9/guilds/${args.guildId}/messages/search`;
+    const baseParams = new URLSearchParams();
+    baseParams.set("author_id", args.userId);
+    if (args.query?.trim()) baseParams.set("content", args.query.trim());
+    if (args.before) baseParams.set("max_id", args.before);
+    if (args.after) baseParams.set("min_id", args.after);
+
+    const selectKeys = new Set(["id", "content", "author", "timestamp", "attachments", "replyTo", "mentions"]);
+    const collected: any[] = [];
+    let totalResults = 0;
+    let offset = startOffset;
+    let indexing = false;
+    let retryAfter: number | null = null;
+
+    while (collected.length < limit) {
+        const p = new URLSearchParams(baseParams);
+        p.set("offset", String(offset));
+        const r = await fetch(`${base}?${p.toString()}`, { headers: { authorization: token } });
+
+        if (r.status === 202) {
+            const j = await r.json().catch(() => ({} as any));
+            indexing = true;
+            retryAfter = j.retry_after || null;
+            break;
+        }
+        if (r.status === 429) {
+            const j = await r.json().catch(() => ({} as any));
+            await sleep(Math.min(10_000, Math.max(250, (j.retry_after || 1) * 1000)));
+            continue;
+        }
+        if (!r.ok) {
+            const body = await r.text().catch(() => "");
+            throw new Error(`Discord guild user search error ${r.status}: ${body.slice(0, 300)}`);
+        }
+
+        const j: any = await r.json();
+        totalResults = j.total_results ?? totalResults;
+        if (!j.messages?.length) break;
+
+        let consumedGroups = 0;
+        for (const group of j.messages) {
+            consumedGroups++;
+            const hit = group.find?.((m: any) => m.hit) || group[Math.floor(group.length / 2)] || group[0];
+            if (!hit) continue;
+            collected.push({
+                ...projectMessage(hit, selectKeys),
+                channelId: hit.channel_id || hit.channelId || null,
+                guildId: args.guildId,
+                hit: true,
+            });
+            if (collected.length >= limit) break;
+        }
+
+        offset += consumedGroups;
+        if (j.messages.length < 25) break;
+    }
+
+    return {
+        guild: guild ? { id: guild.id, name: guild.name } : { id: args.guildId },
+        userId: args.userId,
+        query: args.query?.trim() || null,
+        limit,
+        offset: startOffset,
+        nextOffset: startOffset + collected.length < totalResults ? startOffset + collected.length : null,
+        hasMore: startOffset + collected.length < totalResults,
+        totalResults,
+        count: collected.length,
+        indexing,
+        retryAfter,
+        messages: collected,
+    };
+}
+
 /**
  * Strip-words list — PT + EN chat noise. Stored accent-stripped + lowercase;
  * words from messages are normalized the same way before lookup, so casual PT
@@ -3048,7 +3147,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 28,
+            version: 29,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
@@ -3058,6 +3157,7 @@ export default definePlugin({
             openChannel: bridgeOpenChannel,
             getHistory: bridgeGetHistory,
             searchMessages: bridgeSearchMessages,
+            userMessages: bridgeUserMessages,
             getStats: bridgeGetStats,
             react: bridgeReact,
             editMessage: bridgeEdit,

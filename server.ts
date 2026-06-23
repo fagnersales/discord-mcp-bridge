@@ -668,6 +668,31 @@ mcp.registerTool("discord_search", {
     return runInRenderer(code, 6, 60_000);
 });
 
+mcp.registerTool("discord_user_messages", {
+    description:
+        "Search a specific server for messages sent by a specific user. Uses Discord's " +
+        "native guild message search with `author_id`, so it can span channels the logged-in " +
+        "account can access without scraping the current viewport. This is deliberately " +
+        "bounded: default `limit` is 100, max 500. Use `offset` from `nextOffset` to page " +
+        "through more results, and `before`/`after` snowflakes to narrow the time window. " +
+        "Optional `query` restricts matches to messages containing those words.",
+    inputSchema: {
+        guildId: z.string().regex(/^\d{15,25}$/).describe("Target server/guild ID."),
+        userId: z.string().regex(/^\d{15,25}$/).describe("Author user ID to search for."),
+        query: z.string().optional().describe("Optional Discord search text/content filter."),
+        before: z.string().regex(/^\d{15,25}$/).optional().describe("Snowflake max bound (`max_id`)."),
+        after: z.string().regex(/^\d{15,25}$/).optional().describe("Snowflake min bound (`min_id`)."),
+        offset: z.number().int().min(0).optional().describe("Pagination offset. Use `nextOffset` from the previous result."),
+        limit: z.number().int().min(1).max(500).optional().describe("Max messages to return (default 100, max 500)."),
+    },
+}, async (args) => {
+    const code =
+        `(globalThis.$discordBridge && globalThis.$discordBridge.userMessages)` +
+        `  ? globalThis.$discordBridge.userMessages(${JSON.stringify(args)})` +
+        `  : (() => { throw new Error("DiscordMCP userMessages helper missing — plugin out of date; rebuild & redeploy.") })()`;
+    return runInRenderer(code, 6, 90_000);
+});
+
 mcp.registerTool("discord_stats", {
     description:
         "Compute aggregate stats over a channel + time window — the right tool for \"who " +
@@ -1001,6 +1026,116 @@ mcp.registerTool("discord_guilds", {
         `  ? globalThis.$discordBridge.listGuilds()` +
         `  : (() => { throw new Error("DiscordMCP listGuilds helper missing — plugin out of date; rebuild & redeploy.") })()`;
     return runInRenderer(code, 6);
+});
+
+mcp.registerTool("discord_mute_guild", {
+    description:
+        "Mute or unmute a Discord guild/server by guild ID. This changes the same per-server " +
+        "notification setting as Discord's Server Menu -> Mute Server. Default is dry-run: " +
+        "it verifies membership and reports the target without changing anything. Pass " +
+        "`apply: true` only when the user explicitly asked to mute/unmute that exact server. " +
+        "The default mute duration is `forever`, equivalent to Discord's \"Until I turn it back on\".",
+    inputSchema: {
+        guildId: z.string().regex(/^\d{15,25}$/).describe("Discord guild/server ID to mute or unmute."),
+        action: z.enum(["mute", "unmute"]).optional().describe("Default `mute`. Use `unmute` to turn server notifications back on."),
+        duration: z.enum(["15m", "1h", "3h", "8h", "24h", "forever"]).optional().describe("Mute duration. Default `forever`, matching Discord's \"Until I turn it back on\"."),
+        apply: z.boolean().optional().describe("Default false (dry-run). Pass true to actually update the guild notification setting."),
+    },
+}, async (args) => {
+    const code = `
+        (async () => {
+            const args = ${JSON.stringify(args)};
+            const W = globalThis.Vencord?.Webpack;
+            if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+            const guildId = String(args?.guildId ?? "").trim();
+            if (!/^\\d{15,25}$/.test(guildId)) throw new Error("\`guildId\` must be a Discord snowflake.");
+
+            const GuildStore = W.findByProps("getGuild", "getGuilds");
+            const SettingsStore = W.findByProps("isMuted", "getMuteConfig");
+            const Actions = W.findByProps("updateGuildNotificationSettings", "updateChannelOverrideSettings");
+            if (!SettingsStore?.isMuted)
+                throw new Error("Mute-state store not found - webpack module shape may have changed.");
+            const guild = GuildStore?.getGuild?.(guildId);
+            const durationSeconds = {
+                "15m": 15 * 60,
+                "1h": 60 * 60,
+                "3h": 3 * 60 * 60,
+                "8h": 8 * 60 * 60,
+                "24h": 24 * 60 * 60,
+                "forever": -1,
+            };
+            const action = args?.action === "unmute" ? "unmute" : "mute";
+            const duration = args?.duration || "forever";
+            const selectedWindow = durationSeconds[duration] ?? -1;
+            const before = {
+                muted: SettingsStore?.isMuted?.(guildId) ?? null,
+                muteConfig: SettingsStore?.getMuteConfig?.(guildId) ?? null,
+            };
+            const preview = {
+                guild: guild ? {
+                    id: guild.id,
+                    name: guild.name,
+                    ownerId: guild.ownerId ?? guild.owner_id ?? null,
+                } : { id: guildId, name: null },
+                action,
+                duration: action === "mute" ? duration : null,
+                before,
+            };
+
+            if (!guild) return { applied: false, alreadyAbsent: true, ...preview };
+            if (!Actions?.updateGuildNotificationSettings)
+                throw new Error("Guild notification settings action not found - webpack module shape may have changed.");
+
+            if (!args?.apply) {
+                return {
+                    applied: false,
+                    dryRun: true,
+                    note: "Dry run - membership confirmed but notification settings were not changed. Pass apply: true to update this guild.",
+                    ...preview,
+                };
+            }
+
+            const patch = action === "unmute"
+                ? { muted: false }
+                : {
+                    muted: true,
+                    mute_config: {
+                        selected_time_window: selectedWindow,
+                        end_time: selectedWindow > 0
+                            ? new Date(Date.now() + selectedWindow * 1000).toISOString()
+                            : null,
+                    },
+                };
+
+            await Actions.updateGuildNotificationSettings(guildId, patch);
+
+            for (let i = 0; i < 30; i++) {
+                const mutedNow = SettingsStore?.isMuted?.(guildId);
+                if (action === "mute" ? mutedNow === true : mutedNow === false) break;
+                await new Promise(r => setTimeout(r, 200));
+            }
+
+            const after = {
+                muted: SettingsStore?.isMuted?.(guildId) ?? null,
+                muteConfig: SettingsStore?.getMuteConfig?.(guildId) ?? null,
+            };
+
+            return {
+                applied: true,
+                changed: action === "mute" ? after.muted === true : after.muted === false,
+                ...preview,
+                patch,
+                after,
+                note: action === "mute" && selectedWindow <= 0
+                    ? "Muted until manually turned back on."
+                    : action === "mute"
+                        ? "Muted for the requested duration."
+                        : "Server unmuted.",
+            };
+        })()
+    `;
+    return runInRenderer(code, 6, 30_000);
 });
 
 mcp.registerTool("discord_organize", {
