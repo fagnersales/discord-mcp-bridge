@@ -3147,7 +3147,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 28,
+            version: 29,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
