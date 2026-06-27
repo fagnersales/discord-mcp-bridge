@@ -2891,8 +2891,9 @@ function bridgeGuildMember(guildId: string): unknown {
 
 /**
  * `$discordBridge.waitArm` / `waitPoll` / `waitCancel` — the renderer half of
- * the `discord_waitForMessage` MCP tool. Plugin eval wall-clock is 15s
- * (`BUILD_TIMEOUT_MS`), so we cannot hold a single eval open for a 60s+ wait.
+ * the `discord_waitForMessage` MCP tool. Holding a single eval open for a long
+ * wait monopolizes the serial poll loop for the full duration; callers that need
+ * minutes-long waits should prefer the arm/poll pattern instead.
  * Pattern: `waitArm` subscribes to FluxDispatcher MESSAGE_CREATE synchronously
  * and returns a `waitId`; the MCP side polls `waitPoll` until matches arrive
  * or the deadline elapses. Auto-unsubscribes on match-cap reached, on poll

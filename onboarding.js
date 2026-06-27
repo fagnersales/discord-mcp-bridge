@@ -194,9 +194,12 @@ async function __discordOnboarding(opts) {
         await finishRules();
     }
 
-    const now = readState();
+    // Base completed on the URL, not readState — readState() returns onboarding:false
+    // for both "done" and "stuck on rules screen", so !now.onboarding would falsely
+    // report completed:true if finishRules() ran but couldn't find the Finish button.
+    const finalGuild = guildOf();
     return {
-        completed: !now.onboarding || (!ALL_SERVERS && guildOf() !== startGuild),
+        completed: !finalGuild || (!ALL_SERVERS && finalGuild !== startGuild),
         handled,
         startGuild,
         finalUrl: location.pathname,

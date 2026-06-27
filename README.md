@@ -127,7 +127,7 @@ press `Ctrl+R` — `discord_status` should then report the plugin connected.
 - `discord_leave({guildId, apply?})` — leave a server by guild ID. Destructive.
   **Default is dry-run** — verifies membership and returns the resolved guild
   without leaving. Pass `apply: true` to actually leave; the returned `left`
-  boolean reflects the **live guild store** (re-checked after the REST call),
+  boolean reflects the **live guild store** (re-checked after the leave),
   not a guess.
 
 ### Config
