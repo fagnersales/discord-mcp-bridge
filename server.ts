@@ -1253,7 +1253,7 @@ mcp.registerTool("discord_leave", {
         "After applying, the tool re-checks the live guild store and reports `left:true` " +
         "only when membership is actually gone.",
     inputSchema: {
-        guildId: z.string().regex(/^\d{17,20}$/).describe("Discord guild/server ID to leave."),
+        guildId: z.string().regex(/^\d{15,25}$/).describe("Discord guild/server ID to leave."),
         apply: z.boolean().optional().describe("Default false (dry-run). Pass true to actually leave the guild."),
     },
 }, async (args) => {
