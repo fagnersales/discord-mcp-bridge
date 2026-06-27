@@ -292,13 +292,17 @@ async function pollOnce(): Promise<void> {
 
     if (res.status === 204 || !res.ok) return;          // no command waiting — re-poll
 
-    let cmd: { id?: unknown; code?: unknown; depth?: unknown; kind?: unknown; };
+    let cmd: { id?: unknown; code?: unknown; depth?: unknown; kind?: unknown; timeout?: unknown; };
     try { cmd = await res.json(); } catch { return; }
     if (typeof cmd.id !== "string" || typeof cmd.code !== "string") return;
 
     const depth = typeof cmd.depth === "number" && cmd.depth > 0 ? cmd.depth : 8;
     const kind = cmd.kind === "screenshot" ? "screenshot" : "eval";
-    const timeoutMs = cmd.kind === "screenshot" ? SCREENSHOT_BUILD_TIMEOUT_MS : BUILD_TIMEOUT_MS;
+    // Use the caller's forwarded budget when present; fall back to the defaults.
+    // Screenshots always use their own ceiling regardless.
+    const timeoutMs = cmd.kind === "screenshot"
+        ? SCREENSHOT_BUILD_TIMEOUT_MS
+        : (typeof cmd.timeout === "number" && cmd.timeout > 0 ? cmd.timeout : BUILD_TIMEOUT_MS);
     const buildPromise = cmd.kind === "screenshot"
         ? buildScreenshotReply(cmd.id, cmd.code)
         : buildReply(cmd.id, cmd.code, depth);

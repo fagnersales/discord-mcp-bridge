@@ -41,7 +41,7 @@ const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 /* ---------------------------------------------------------------- bridge -- */
 
-interface Command { id: string; code: string; depth: number; kind?: "screenshot"; }
+interface Command { id: string; code: string; depth: number; kind?: "screenshot"; timeout?: number; }
 interface BridgeReply { id: string; ok: boolean; result?: unknown; error?: string; }
 
 let nextId = 1;
@@ -103,7 +103,10 @@ function queueCommand(
             reject(new Error(`Bridge call timed out after ${timeoutMs}ms with no reply from the Discord plugin.`));
         }, timeoutMs);
         pending.set(id, { resolve, reject, timer });
-        deliver({ id, code, depth, kind });
+        // Forward the caller's budget to the plugin so long-running evals
+        // (e.g. discord_onboarding with 120s) are not cut off at the plugin's
+        // default 15s cap. Screenshots keep their own fixed ceiling.
+        deliver({ id, code, depth, kind, timeout: kind !== "screenshot" ? timeoutMs : undefined });
     });
 }
 

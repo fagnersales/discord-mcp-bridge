@@ -1267,41 +1267,38 @@ mcp.registerTool("discord_leave", {
             if (!/^\\d{17,20}$/.test(guildId)) throw new Error("\`guildId\` must be a Discord snowflake.");
 
             const GuildStore = W.findByProps("getGuild", "getGuilds");
+            const UserStore = W.findByProps("getCurrentUser");
             const guild = GuildStore?.getGuild?.(guildId);
+            const ownerId = guild?.ownerId ?? guild?.owner_id ?? null;
             const preview = {
-                guild: guild ? {
-                    id: guild.id,
-                    name: guild.name,
-                    ownerId: guild.ownerId ?? guild.owner_id ?? null,
-                } : { id: guildId, name: null },
+                guild: guild ? { id: guild.id, name: guild.name, ownerId } : { id: guildId, name: null },
             };
 
             if (!guild) return { left: false, alreadyAbsent: true, ...preview };
+
+            const me = UserStore?.getCurrentUser?.();
+            if (me && ownerId && ownerId === me.id) {
+                return {
+                    left: false,
+                    ownsGuild: true,
+                    note: "You own this guild — transfer ownership before leaving. Discord rejects owner leaves.",
+                    ...preview,
+                };
+            }
+
             if (!args?.apply) {
                 return {
                     left: false,
                     dryRun: true,
-                    note: "Dry run - membership confirmed but not changed. Pass apply: true to leave this guild.",
+                    note: "Dry run — membership confirmed but not changed. Pass apply: true to leave this guild.",
                     ...preview,
                 };
             }
 
-            const tokenModule = W.findByProps("getToken") || W.findByProps("getCachedToken");
-            const token = tokenModule?.getToken?.() || tokenModule?.getCachedToken?.();
-            if (!token) throw new Error("Auth token unavailable from webpack.");
-
-            const res = await fetch("https://discord.com/api/v9/users/@me/guilds/" + guildId, {
-                method: "DELETE",
-                headers: { authorization: token },
-            });
-            if (!res.ok && res.status !== 204) {
-                const body = await res.text().catch(() => "");
-                return {
-                    left: false,
-                    error: "Discord REST leave guild error " + res.status + ": " + body.slice(0, 300),
-                    ...preview,
-                };
-            }
+            const GuildActions = W.findByProps("leaveGuild");
+            if (!GuildActions?.leaveGuild)
+                throw new Error("GuildActions.leaveGuild not found — webpack module shape may have changed.");
+            GuildActions.leaveGuild(guildId);
 
             for (let i = 0; i < 30; i++) {
                 if (!GuildStore?.getGuild?.(guildId)) break;

@@ -53,12 +53,17 @@ async function __discordOnboarding(opts) {
     };
 
     // The bottom-right advance button. Reads "Skip" until a selection is made,
-    // then morphs to "Next"/"Continue"/etc. Bottom-most match wins.
+    // then morphs to "Next"/"Continue"/etc. Picks the visible button with the
+    // lowest screen position to avoid stray matches outside the onboarding overlay.
     const advBtn = () => {
-        let adv = null;
+        const vw = window.innerWidth, vh = window.innerHeight;
+        let adv = null, adv_y = -1;
         for (const el of document.querySelectorAll('button,[role="button"]')) {
             const t = (el.textContent || "").trim();
-            if (/^(Skip|Next|Continue|Done|Submit|Finish)\b/i.test(t)) adv = el;
+            if (!/^(Skip|Next|Continue|Done|Submit|Finish)\b/i.test(t)) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0 || r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) continue;
+            if (r.bottom > adv_y) { adv = el; adv_y = r.bottom; }
         }
         return adv;
     };
@@ -80,10 +85,14 @@ async function __discordOnboarding(opts) {
     };
 
     // Leaf element holding the "Question X of Y" caption.
+    // Uses TreeWalker (text nodes only) instead of querySelectorAll("*") to avoid
+    // scanning the full element tree on every readState / waitNext poll.
     const qHead = () => {
-        for (const el of document.querySelectorAll("*")) {
-            if (el.children.length) continue;
-            if (/^Question\s+\d+\s+of\s+\d+$/i.test((el.textContent || "").trim())) return el;
+        const walker = document.createTreeWalker(document.body || document, NodeFilter.SHOW_TEXT);
+        let node;
+        while ((node = walker.nextNode())) {
+            if (/^Question\s+\d+\s+of\s+\d+$/i.test((node.textContent || "").trim()))
+                return node.parentElement;
         }
         return null;
     };
