@@ -29,6 +29,7 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const DAEMON_PATH = new URL("./daemon.ts", import.meta.url).pathname;
 const PERF_LOG = new URL("./perf.log", import.meta.url).pathname;
 const NOTES_PATH = new URL("./notes.json", import.meta.url).pathname;
+const ONBOARDING_PATH = new URL("./onboarding.js", import.meta.url).pathname;
 
 /**
  * User config lives in a plain JSON file so it persists across sessions and the
@@ -346,6 +347,35 @@ mcp.registerTool("discord_click", {
         },
     };
 })()`));
+
+mcp.registerTool("discord_onboarding", {
+    description:
+        "Auto-complete a Discord server's onboarding questionnaire — the \"Question X of Y\" " +
+        "flow shown right after you join a community server. Walks every question in order: a " +
+        "Required question gets its first option selected and then Next; an optional question is " +
+        "Skipped (set `answerOptional` to select its first option instead). Repeats until the " +
+        "questionnaire closes. Scoped to the current server's onboarding unless `allServers` is " +
+        "set (Discord chains several freshly-joined servers' onboarding back-to-back). Returns a " +
+        "per-question log. Safe no-op (reports it) when no onboarding question is on screen.",
+    inputSchema: {
+        answerOptional: z.boolean().optional().describe("Also select the first option on OPTIONAL questions instead of skipping them (default false — optional questions are skipped)."),
+        allServers: z.boolean().optional().describe("Keep going through every pending server's onboarding, not just the current one (default false)."),
+        maxQuestions: z.number().int().min(1).max(100).optional().describe("Safety cap on how many questions to process (default 40)."),
+    },
+}, async ({ answerOptional, allServers, maxQuestions }) => {
+    let src: string;
+    try { src = readFileSync(ONBOARDING_PATH, "utf8"); }
+    catch (e) { return text("Could not load onboarding script (" + ONBOARDING_PATH + "): " + errMsg(e), true); }
+    const opts = {
+        answerOptional: answerOptional ?? false,
+        allServers: allServers ?? false,
+        maxQuestions: maxQuestions ?? 40,
+    };
+    // Onboarding can take several seconds per question; give it a generous
+    // renderer budget (the daemon clamps eval timeouts to ≤300s).
+    const code = src + "\nreturn await __discordOnboarding(" + JSON.stringify(opts) + ");";
+    return runInRenderer(code, undefined, 120_000);
+});
 
 mcp.registerTool("discord_key", {
     description:
@@ -1213,6 +1243,81 @@ async function runCaptchaHook(
     try { stderr = (await new Response(proc.stderr).text()).slice(0, 2000); } catch { /* ignore */ }
     return { ok: !timedOut && exitCode === 0, timedOut, exitCode, stderr };
 }
+
+mcp.registerTool("discord_leave", {
+    description:
+        "Leave a Discord guild/server by guild ID. Destructive: the account leaves the " +
+        "server and may lose access to its channels immediately. Default is dry-run: it " +
+        "verifies current membership and returns the resolved guild without leaving. Pass " +
+        "`apply: true` only when the user explicitly asked to leave that exact server ID. " +
+        "After applying, the tool re-checks the live guild store and reports `left:true` " +
+        "only when membership is actually gone.",
+    inputSchema: {
+        guildId: z.string().regex(/^\d{15,25}$/).describe("Discord guild/server ID to leave."),
+        apply: z.boolean().optional().describe("Default false (dry-run). Pass true to actually leave the guild."),
+    },
+}, async (args) => {
+    const code = `
+        (async () => {
+            const args = ${JSON.stringify(args)};
+            const W = globalThis.Vencord?.Webpack;
+            if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+
+            const guildId = String(args?.guildId ?? "").trim();
+            if (!/^\\d{17,20}$/.test(guildId)) throw new Error("\`guildId\` must be a Discord snowflake.");
+
+            const GuildStore = W.findByProps("getGuild", "getGuilds");
+            const UserStore = W.findByProps("getCurrentUser");
+            const guild = GuildStore?.getGuild?.(guildId);
+            const ownerId = guild?.ownerId ?? guild?.owner_id ?? null;
+            const preview = {
+                guild: guild ? { id: guild.id, name: guild.name, ownerId } : { id: guildId, name: null },
+            };
+
+            if (!guild) return { left: false, alreadyAbsent: true, ...preview };
+
+            const me = UserStore?.getCurrentUser?.();
+            if (me && ownerId && ownerId === me.id) {
+                return {
+                    left: false,
+                    ownsGuild: true,
+                    note: "You own this guild — transfer ownership before leaving. Discord rejects owner leaves.",
+                    ...preview,
+                };
+            }
+
+            if (!args?.apply) {
+                return {
+                    left: false,
+                    dryRun: true,
+                    note: "Dry run — membership confirmed but not changed. Pass apply: true to leave this guild.",
+                    ...preview,
+                };
+            }
+
+            const GuildActions = W.findByProps("leaveGuild");
+            if (!GuildActions?.leaveGuild)
+                throw new Error("GuildActions.leaveGuild not found — webpack module shape may have changed.");
+            GuildActions.leaveGuild(guildId);
+
+            for (let i = 0; i < 30; i++) {
+                if (!GuildStore?.getGuild?.(guildId)) break;
+                await new Promise(r => setTimeout(r, 200));
+            }
+
+            const stillMember = !!GuildStore?.getGuild?.(guildId);
+            return {
+                left: !stillMember,
+                stillMember,
+                ...preview,
+                note: stillMember
+                    ? "Discord accepted the leave request, but the guild is still in the local store. Re-check shortly."
+                    : "Left guild and confirmed it is absent from the local guild store.",
+            };
+        })()
+    `;
+    return runInRenderer(code, 6, 30_000);
+});
 
 mcp.registerTool("discord_join", {
     description:

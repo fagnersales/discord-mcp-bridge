@@ -116,6 +116,19 @@ press `Ctrl+R` — `discord_status` should then report the plugin connected.
   returned `joined` boolean reflects the **live guild store**, not a guess.
   Large/flagged servers gate joins behind a captcha the bridge can't solve
   (cross-origin anti-bot iframe) — see *Captcha* below.
+- `discord_onboarding({answerOptional?, allServers?, maxQuestions?})` —
+  auto-complete the *"Question X of Y"* onboarding questionnaire shown right
+  after joining a community server. Required questions get their first option
+  selected then Next; optional questions are Skipped (`answerOptional: true` to
+  answer them too). Scoped to the current server unless `allServers: true`
+  (Discord chains several freshly-joined servers' onboarding back-to-back).
+  Safe no-op (reports it) when no onboarding screen is up. Returns a
+  per-question log.
+- `discord_leave({guildId, apply?})` — leave a server by guild ID. Destructive.
+  **Default is dry-run** — verifies membership and returns the resolved guild
+  without leaving. Pass `apply: true` to actually leave; the returned `left`
+  boolean reflects the **live guild store** (re-checked after the leave),
+  not a guess.
 
 ### Config
 
