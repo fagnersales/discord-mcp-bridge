@@ -6,13 +6,15 @@
  * and sends it to the renderer, so this file must define `__discordOnboarding`
  * and reference only renderer globals (document/window/...).
  *
- * Per question in the "Question X of Y" flow shown after joining a community
- * server:
- *   - Required question  -> select the first option, then click Next.
- *   - Optional question  -> click Skip (unless opts.answerOptional).
- * Repeat until the questionnaire closes. Scoped to the current server's
- * onboarding unless opts.allServers is set (Discord chains the onboarding of
- * several freshly-joined servers back-to-back).
+ * Flow handled:
+ *   1. "Question X of Y" questionnaire — required questions get the first option
+ *      selected then Next; optional questions are Skipped (unless opts.answerOptional).
+ *   2. "One last step! Read & Agree to Server Rules" — the final gate Discord shows
+ *      after the questionnaire. Has no "Question X of Y" heading, so it's detected
+ *      separately and completed by clicking the Finish button.
+ *
+ * Scoped to the current server's onboarding unless opts.allServers is set (Discord
+ * chains the onboarding of several freshly-joined servers back-to-back).
  *
  * Keep this dependency-free and resilient to Discord's hashed CSS class names
  * (match by stable substrings like `optionButtonWrapper`, never exact hashes).
@@ -61,6 +63,21 @@ async function __discordOnboarding(opts) {
         return adv;
     };
     const advText = () => { const a = advBtn(); return a ? (a.textContent || "").trim() : null; };
+
+    // Detect the "One last step! Read & Agree to Server Rules" screen.
+    // It appears after the Q&A flow but has no "Question X of Y" heading.
+    const rulesScreen = () =>
+        !!guildOf() && /Read\s*&\s*Agree/i.test(document.body ? document.body.textContent || "" : "");
+
+    // Click Finish on the rules screen and wait for the URL to leave /onboarding.
+    const finishRules = async () => {
+        const fin = advBtn();
+        if (!fin) { log.push("Rules screen: no Finish button found — cannot complete."); return; }
+        fire(fin);
+        handled++;
+        for (let i = 0; i < 30; i++) { await sleep(200); if (!guildOf()) break; }
+        log.push("Rules screen: Finish clicked — onboarding complete.");
+    };
 
     // Leaf element holding the "Question X of Y" caption.
     const qHead = () => {
@@ -115,7 +132,7 @@ async function __discordOnboarding(opts) {
 
     const startGuild = guildOf();
     const init = readState();
-    if (!init.onboarding) {
+    if (!init.onboarding && !rulesScreen()) {
         return { completed: false, handled: 0, startGuild, finalUrl: location.pathname,
             log: ["No onboarding question is on screen — nothing to do."] };
     }
@@ -160,6 +177,12 @@ async function __discordOnboarding(opts) {
             log.push("  Next server's onboarding appeared (" + after.guild + ") — stopping.");
             break;
         }
+    }
+
+    // After the Q&A loop Discord may land on the rules screen before closing onboarding.
+    if (rulesScreen()) {
+        log.push("Rules screen after Q&A — clicking Finish.");
+        await finishRules();
     }
 
     const now = readState();
