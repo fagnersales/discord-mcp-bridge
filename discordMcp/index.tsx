@@ -506,19 +506,6 @@ async function bridgeSendMessage(args: SendArgs): Promise<unknown> {
     const channel = ChannelStore?.getChannel?.(id);
     if (!channel) throw new Error("Channel not found: " + id);
 
-    // Pre-flight: if the renderer is on a different channel, `sendMessage`'s
-    // wait-for-channel-ready can hang forever (Discord waits for the channel
-    // to open in the UI, but nothing here opens it). Select first; the send
-    // path also passes `false` below to belt-and-suspenders the wedge.
-    if (ChannelActions?.selectChannel && SelectedChannelStore?.getChannelId?.() !== id) {
-        ChannelActions.selectChannel({ guildId: channel.guild_id || null, channelId: id });
-        const deadline = Date.now() + 1500;
-        while (Date.now() < deadline) {
-            if (SelectedChannelStore?.getChannelId?.() === id) break;
-            await new Promise(r => setTimeout(r, 25));
-        }
-    }
-
     const channelInfo = {
         id,
         name: channel.name || (channel.recipients?.length ? "(DM)" : null),
@@ -582,6 +569,30 @@ async function bridgeSendMessage(args: SendArgs): Promise<unknown> {
         }
     }
 
+    // Snapshot the user's current channel as late as possible — right before we
+    // switch away — so if they navigated somewhere during the typing pause above,
+    // the `finally` restores them to where they actually are now, not where they
+    // were when the send started. An agent send must never leave the user's
+    // Vesktop parked on someone else's DM.
+    const prevChannelId = SelectedChannelStore?.getChannelId?.() ?? null;
+    const switchedChannel = !!(ChannelActions?.selectChannel && prevChannelId !== id);
+
+    // Pre-flight: if the renderer is on a different channel, `sendMessage`'s
+    // wait-for-channel-ready can hang forever (Discord waits for the channel to
+    // open in the UI, but nothing here opens it). Select first; the send path
+    // also passes `false` below to belt-and-suspenders the wedge. Typing is
+    // keyed by channel id, so it already fired above without the switch — this
+    // only shows the target channel for the actual send + the restore below.
+    if (switchedChannel) {
+        ChannelActions.selectChannel({ guildId: channel.guild_id || null, channelId: id });
+        const deadline = Date.now() + 1500;
+        while (Date.now() < deadline) {
+            if (SelectedChannelStore?.getChannelId?.() === id) break;
+            await new Promise(r => setTimeout(r, 25));
+        }
+    }
+
+    try {
     if (args.files?.length) {
         const fileObjs = args.files.map(f => {
             const bin = atob(f.base64);
@@ -633,6 +644,20 @@ async function bridgeSendMessage(args: SendArgs): Promise<unknown> {
             validNonShortcutEmojis: [],
             tts,
         }, false, messageReference ? { messageReference } : {});
+    }
+    } finally {
+        // Best-effort restore of the user's pre-send channel; a restore failure
+        // must never mask the send result. prevChannelId is null when no channel
+        // was open (home / guild-home), so restore is skipped in that case.
+        if (switchedChannel && prevChannelId) {
+            try {
+                const prevChannel = ChannelStore?.getChannel?.(prevChannelId);
+                ChannelActions.selectChannel({
+                    guildId: prevChannel?.guild_id || null,
+                    channelId: prevChannelId,
+                });
+            } catch { /* view restore is best-effort */ }
+        }
     }
 
     return {
@@ -3152,7 +3177,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 29,
+            version: 31,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,

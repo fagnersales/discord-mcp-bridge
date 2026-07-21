@@ -38,8 +38,24 @@ Needs [Bun](https://bun.sh), Claude Code, and a Vencord **source build**.
 ```bash
 git clone https://github.com/fagnersales/discord-mcp-bridge.git
 cd discord-mcp-bridge
-./install.sh ~/Vencord      # bun install + symlink discordMcp into Vencord
+./install.sh ~/Vencord      # bun install + copy discordMcp into Vencord
 ```
+
+The installer copies the plugin instead of symlinking it. Vencord's esbuild
+build follows symlinks to their real path; if the plugin source appears outside
+the Vencord tree, aliases like `@api/Settings` and `@webpack` fail to resolve.
+After editing files in `discordMcp/`, run `./install.sh ~/Vencord` again before
+rebuilding Vencord.
+
+If you use Vesktop and have other folders under `src/userplugins`, build with:
+
+```bash
+./build-vencord-discordmcp-only.sh ~/Vencord
+```
+
+Vencord builds every userplugin it finds. This helper temporarily moves other
+userplugins aside, builds the dist with only DiscordMCP, then restores them in
+the source tree.
 
 Then register the MCP server with Claude Code (user scope) and restart it:
 

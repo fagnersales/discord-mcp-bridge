@@ -140,10 +140,22 @@ async function __discordOnboarding(opts) {
     };
 
     const startGuild = guildOf();
-    const init = readState();
+    // Poll up to 10s for the questionnaire DOM to appear.  The caller navigates
+    // to /onboarding first, but Discord may not have rendered the React tree yet.
+    // discord_onboarding runs with a 120s renderer budget (server.ts forwards it
+    // via the daemon, overriding the plugin's 15s default), so 10s is well within
+    // budget with plenty of headroom for the rest of the questionnaire walk.
+    let init = readState();
+    if (!init.onboarding && !rulesScreen()) {
+        for (let i = 0; i < 10; i++) {
+            await sleep(1000);
+            init = readState();
+            if (init.onboarding || rulesScreen()) break;
+        }
+    }
     if (!init.onboarding && !rulesScreen()) {
         return { completed: false, handled: 0, startGuild, finalUrl: location.pathname,
-            log: ["No onboarding question is on screen — nothing to do."] };
+            log: ["No onboarding question is on screen — nothing to do (polled 10s)."] };
     }
 
     let handled = 0, prevCur = -1, prevGuild = startGuild;
