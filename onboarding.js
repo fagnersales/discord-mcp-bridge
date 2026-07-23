@@ -9,6 +9,9 @@
  * Flow handled:
  *   1. "Question X of Y" questionnaire — required questions get the first option
  *      selected then Next; optional questions are Skipped (unless opts.answerOptional).
+ *      Two answer widgets exist: the option-button grid (`optionButtonWrapper`) and
+ *      a "Select..." dropdown (a combobox input whose listbox renders in a portal);
+ *      the dropdown is expanded first, then its first `[role="option"]` is clicked.
  *   2. "One last step! Read & Agree to Server Rules" — the final gate Discord shows
  *      after the questionnaire. Has no "Question X of Y" heading, so it's detected
  *      separately and completed by clicking the Finish button.
@@ -74,10 +77,51 @@ async function __discordOnboarding(opts) {
     const rulesScreen = () =>
         !!guildOf() && /Read\s*&\s*Agree/i.test(document.body ? document.body.textContent || "" : "");
 
+    // Nudge every overflowing scroller on screen down by one viewport. Returns
+    // whether anything actually moved — false when nothing overflows (a tall
+    // window shows the whole rules list, so there is nothing to scroll).
+    const scrollStep = () => {
+        let moved = false;
+        for (const s of document.querySelectorAll('[class*="scroller"]')) {
+            if (s.scrollHeight <= s.clientHeight + 20 || s.clientHeight <= 100) continue;
+            const before = s.scrollTop;
+            s.scrollTop = Math.min(s.scrollHeight, before + s.clientHeight);
+            s.dispatchEvent(new Event("scroll", { bubbles: true }));
+            if (s.scrollTop > before) moved = true;
+        }
+        return moved;
+    };
+
+    // Wait for the rules screen's Finish button to become clickable, reacting to
+    // the button's own state rather than assuming any particular gate. It may be
+    // enabled immediately (short rules list, or a window tall enough that there is
+    // nothing to scroll); when it is not, the usual gate is the unread rules list
+    // ("You must finish reading the rules to join"), so each poll also nudges any
+    // scroller — a no-op when nothing overflows. Anything else that enables it on
+    // its own (a late render, a slow request) is picked up by the same poll.
+    const waitFinishEnabled = async () => {
+        let scrolled = false;
+        for (let i = 0; i < 40; i++) {
+            const fin = advBtn();
+            if (fin && !fin.disabled) return { ok: true, scrolled };
+            if (scrollStep()) scrolled = true;
+            await sleep(200);
+        }
+        const fin = advBtn();
+        return { ok: !!fin && !fin.disabled, scrolled };
+    };
+
     // Click Finish on the rules screen and wait for the URL to leave /onboarding.
     const finishRules = async () => {
-        const fin = advBtn();
+        let fin = advBtn();
         if (!fin) { log.push("Rules screen: no Finish button found — cannot complete."); return; }
+        if (fin.disabled) {
+            const st = await waitFinishEnabled();
+            log.push("Rules screen: Finish started disabled — waited for it to enable (enabled=" +
+                st.ok + ", scrolled=" + st.scrolled + ").");
+            fin = advBtn();
+            if (!fin || fin.disabled) { log.push("Rules screen: Finish still disabled — cannot complete."); return; }
+        }
         fire(fin);
         handled++;
         for (let i = 0; i < 30; i++) { await sleep(200); if (!guildOf()) break; }
@@ -112,20 +156,71 @@ async function __discordOnboarding(opts) {
 
     const optionWraps = () => [...document.querySelectorAll('[class*="optionButtonWrapper"]')];
 
-    // Click the first answer option. The clickable handler sits on the inner
-    // optionButton (cursor:pointer), not the wrapper (cursor:auto).
-    const selectFirstOption = () => {
-        const ws = optionWraps();
-        if (!ws.length) return { ok: false, reason: "no options found" };
-        const w = ws[0];
-        if (/selected/i.test(w.className)) return { ok: true, already: true };
-        const btn = w.querySelector('[class*="optionButton__"]') || w;
-        const r = btn.getBoundingClientRect();
+    // Click the deepest painted node inside `box` (see fire()'s note on React's
+    // delegated handlers), falling back to the box itself when the centre point
+    // is covered by something outside it.
+    const fireInside = (box) => {
+        const r = box.getBoundingClientRect();
         const cx = Math.round(r.left + r.width / 2), cy = Math.round(r.top + r.height / 2);
         let el = document.elementFromPoint(cx, cy);
-        if (!el || !btn.contains(el)) el = btn;
+        if (!el || !box.contains(el)) el = box;
         fire(el);
+    };
+
+    // Dropdown-style question: a visible "Select..." combobox input. Its listbox
+    // renders in a portal outside the field, so options are looked up globally.
+    const comboInput = () => {
+        for (const el of document.querySelectorAll('input[role="combobox"]')) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) return el;
+        }
+        return null;
+    };
+    const listOptions = () => [...document.querySelectorAll('[role="option"]')];
+
+    // Expand the dropdown and pick its first option. Discord's combobox keeps the
+    // listbox open after a pick (it's multi-select), which is fine — the advance
+    // button is clicked by event dispatch, not by hit-testing, so the open popover
+    // cannot occlude it.
+    const selectFirstDropdownOption = async () => {
+        const inp = comboInput();
+        if (!inp) return { ok: false, reason: "no options found" };
+        if (inp.getAttribute("aria-expanded") !== "true") {
+            try { inp.focus(); } catch (e) { /* ignore */ }
+            fire(inp);
+        }
+        let opts = [];
+        for (let i = 0; i < 20; i++) { opts = listOptions(); if (opts.length) break; await sleep(150); }
+        if (!opts.length) return { ok: false, reason: "dropdown did not expand" };
+        if (opts[0].getAttribute("aria-selected") === "true") return { ok: true, already: true };
+        fireInside(opts[0]);
+        for (let i = 0; i < 20; i++) {
+            await sleep(150);
+            if (firstSelected() || (advText() || "") !== "Skip") break;
+        }
         return { ok: true };
+    };
+
+    // Click the first answer option. The clickable handler sits on the inner
+    // optionButton (cursor:pointer), not the wrapper (cursor:auto).
+    const selectFirstOption = async () => {
+        const ws = optionWraps();
+        if (!ws.length) return await selectFirstDropdownOption();
+        const w = ws[0];
+        if (/selected/i.test(w.className)) return { ok: true, already: true };
+        fireInside(w.querySelector('[class*="optionButton__"]') || w);
+        return { ok: true };
+    };
+
+    // Whether this question now has an answer, for either widget. For a dropdown
+    // whose listbox has collapsed, the picked value survives as a tag in the field.
+    const firstSelected = () => {
+        const w0 = optionWraps()[0];
+        if (w0) return /selected/i.test(w0.className);
+        const o0 = listOptions()[0];
+        if (o0) return o0.getAttribute("aria-selected") === "true";
+        const field = document.querySelector('[class*="selectFieldContainer"]');
+        return !!field && !!(field.textContent || "").trim();
     };
 
     // Wait until the question advances, the questionnaire closes, or the guild
@@ -174,11 +269,10 @@ async function __discordOnboarding(opts) {
         prevCur = st.current; prevGuild = st.guild;
 
         if (st.required || ANSWER_OPTIONAL) {
-            const sel = selectFirstOption();
+            const sel = await selectFirstOption();
             // Give the advance button a moment to morph away from "Skip".
             for (let i = 0; i < 16; i++) { await sleep(150); if ((advText() || "") !== "Skip") break; }
-            const w0 = optionWraps()[0];
-            const selected = w0 ? /selected/i.test(w0.className) : false;
+            const selected = firstSelected();
             const tag = st.required ? "[required]" : "[optional]";
             log.push("Q" + st.current + "/" + st.total + " " + tag +
                 " -> selected first option (selected=" + selected + ", button=\"" + advText() + "\"" +

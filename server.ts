@@ -353,7 +353,9 @@ mcp.registerTool("discord_onboarding", {
         "Auto-complete a Discord server's onboarding questionnaire — the \"Question X of Y\" " +
         "flow shown right after you join a community server. Walks every question in order: a " +
         "Required question gets its first option selected and then Next; an optional question is " +
-        "Skipped (set `answerOptional` to select its first option instead). Repeats until the " +
+        "Skipped (set `answerOptional` to select its first option instead). Handles both answer " +
+        "widgets: the option-button grid and a \"Select...\" dropdown (expanded first, then its " +
+        "first entry picked). Repeats until the " +
         "questionnaire closes. Scoped to the current server's onboarding unless `allServers` is " +
         "set (Discord chains several freshly-joined servers' onboarding back-to-back). Returns a " +
         "per-question log. Safe no-op (reports it) when no onboarding question is on screen.",
