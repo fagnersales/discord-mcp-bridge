@@ -356,9 +356,12 @@ mcp.registerTool("discord_onboarding", {
         "Skipped (set `answerOptional` to select its first option instead). Handles both answer " +
         "widgets: the option-button grid and a \"Select...\" dropdown (expanded first, then its " +
         "first entry picked). Repeats until the " +
-        "questionnaire closes. Scoped to the current server's onboarding unless `allServers` is " +
+        "questionnaire closes, then completes the \"Read & Agree to Server Rules\" gate that " +
+        "follows it — whose Finish button stays disabled until the rules have been read to the " +
+        "end. Scoped to the current server's onboarding unless `allServers` is " +
         "set (Discord chains several freshly-joined servers' onboarding back-to-back). Returns a " +
-        "per-question log. Safe no-op (reports it) when no onboarding question is on screen.",
+        "per-question log; a step that did not take is reported as such rather than as success. " +
+        "Safe no-op (reports it) when no onboarding question is on screen.",
     inputSchema: {
         answerOptional: z.boolean().optional().describe("Also select the first option on OPTIONAL questions instead of skipping them (default false — optional questions are skipped)."),
         allServers: z.boolean().optional().describe("Keep going through every pending server's onboarding, not just the current one (default false)."),
@@ -368,15 +371,19 @@ mcp.registerTool("discord_onboarding", {
     let src: string;
     try { src = readFileSync(ONBOARDING_PATH, "utf8"); }
     catch (e) { return text("Could not load onboarding script (" + ONBOARDING_PATH + "): " + errMsg(e), true); }
+    // Onboarding can take several seconds per question; give it a generous
+    // renderer budget (the daemon clamps eval timeouts to ≤300s). The script
+    // stops itself 15s earlier — the per-question log lives only in the
+    // renderer, so a killed eval would return none of it.
+    const RENDERER_MS = 120_000;
     const opts = {
         answerOptional: answerOptional ?? false,
         allServers: allServers ?? false,
         maxQuestions: maxQuestions ?? 40,
+        budgetMs: RENDERER_MS - 15_000,
     };
-    // Onboarding can take several seconds per question; give it a generous
-    // renderer budget (the daemon clamps eval timeouts to ≤300s).
     const code = src + "\nreturn await __discordOnboarding(" + JSON.stringify(opts) + ");";
-    return runInRenderer(code, undefined, 120_000);
+    return runInRenderer(code, undefined, RENDERER_MS);
 });
 
 mcp.registerTool("discord_key", {

@@ -31,6 +31,11 @@ async function __discordOnboarding(opts) {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const log = [];
 
+    // Stop before the caller's renderer timeout kills the eval: `log` only exists
+    // here, so a walk that overruns would return nothing at all.
+    const deadline = Date.now() + Math.max(10000, Math.min(280000, opts.budgetMs || 105000));
+    const outOfTime = () => Date.now() > deadline;
+
     // The guild whose onboarding we're on, from /channels/<id>/onboarding.
     const guildOf = () => {
         const m = location.pathname.match(/\/channels\/(\d+)\/onboarding/);
@@ -83,21 +88,28 @@ async function __discordOnboarding(opts) {
         !!guildOf() && /Read\s*&\s*Agree/i.test(document.body ? document.body.textContent || "" : "");
 
     // Leaf element holding some onboarding caption, e.g. "Question 1 of 3".
-    // Uses TreeWalker (text nodes only) instead of querySelectorAll("*") to avoid
-    // scanning the full element tree on every readState / waitNext poll.
+    // The element pass catches a caption Discord split across several nodes,
+    // which the text-node walk alone would miss.
     const captionEl = (re) => {
         const walker = document.createTreeWalker(document.body || document, NodeFilter.SHOW_TEXT);
         let node;
         while ((node = walker.nextNode())) {
             if (re.test((node.textContent || "").trim())) return node.parentElement;
         }
-        return null;
+        let deepest = null;
+        for (const el of (document.body || document).querySelectorAll("*")) {
+            if (!re.test((el.textContent || "").trim())) continue;
+            if (!deepest || deepest.contains(el)) deepest = el;
+        }
+        return deepest;
     };
 
-    // Nearest ancestor of `from` that contains something matching `sel` — the
-    // onboarding overlay, reached from a caption inside it. The cap keeps a
-    // screen that has no such descendant from resolving to <body>.
+    // The overlay a caption sits in: Discord renders onboarding in a modal, so
+    // prefer its dialog ancestor and fall back to the nearest ancestor holding
+    // `sel`, capped so a screen without one cannot resolve to <body>.
     const scopeAround = (from, sel) => {
+        const dialog = from && from.closest('[role="dialog"]');
+        if (dialog && dialog.querySelector(sel)) return dialog;
         for (let el = from, i = 0; el && i < 10; i++, el = el.parentElement)
             if (el.querySelector(sel)) return el;
         return null;
@@ -108,7 +120,7 @@ async function __discordOnboarding(opts) {
     // behind it would drive Discord's history pagination and read state.
     const scrollStep = () => {
         const root = scopeAround(captionEl(/Read\s*&\s*Agree/i), '[class*="scroller"]');
-        if (!root) return false;
+        if (!root || root === document.body || root === document.documentElement) return false;
         let moved = false;
         for (const s of root.querySelectorAll('[class*="scroller"]')) {
             if (s.scrollHeight <= s.clientHeight + 20 || s.clientHeight <= 100) continue;
@@ -125,13 +137,14 @@ async function __discordOnboarding(opts) {
     // the button can also enable on its own (short list, tall window, late render).
     const waitFinishEnabled = async () => {
         let scrolled = false;
-        for (let i = 0; i < 40; i++) {
+        for (let i = 0; i < 40 && !outOfTime(); i++) {
             const fin = advBtn();
             if (fin && !isDisabled(fin)) return { ok: true, scrolled };
             if (scrollStep()) scrolled = true;
             await sleep(200);
         }
-        return { ok: !isDisabled(advBtn()) && !!advBtn(), scrolled };
+        const fin = advBtn();
+        return { ok: !!fin && !isDisabled(fin), scrolled };
     };
 
     // Click Finish on the rules screen and wait for the URL to leave /onboarding.
@@ -147,8 +160,10 @@ async function __discordOnboarding(opts) {
         }
         fire(fin);
         handled++;
-        for (let i = 0; i < 30; i++) { await sleep(200); if (!guildOf()) break; }
-        log.push("Rules screen: Finish clicked — onboarding complete.");
+        let left = false;
+        for (let i = 0; i < 30 && !outOfTime(); i++) { await sleep(200); if (!guildOf()) { left = true; break; } }
+        log.push(left ? "Rules screen: Finish clicked — onboarding complete."
+            : "Rules screen: Finish clicked but onboarding is still on screen after 6s — not complete.");
     };
 
     const qHead = () => captionEl(/^Question\s+\d+\s+of\s+\d+$/i);
@@ -213,11 +228,11 @@ async function __discordOnboarding(opts) {
             fire(inp);
         }
         let items = [];
-        for (let i = 0; i < 20; i++) { items = listOptions(inp); if (items.length) break; await sleep(150); }
+        for (let i = 0; i < 20 && !outOfTime(); i++) { items = listOptions(inp); if (items.length) break; await sleep(150); }
         if (!items.length) return { ok: false, reason: "dropdown did not expand" };
         if (items[0].getAttribute("aria-selected") === "true") return { ok: true, already: true };
         fireInside(items[0]);
-        for (let i = 0; i < 20; i++) {
+        for (let i = 0; i < 20 && !outOfTime(); i++) {
             await sleep(150);
             if (firstSelected() || (advText() || "") !== "Skip") break;
         }
@@ -242,6 +257,7 @@ async function __discordOnboarding(opts) {
         const w0 = optionWraps()[0];
         if (w0) return /selected/i.test(w0.className);
         const inp = comboInput();
+        if (!inp) return false;
         const o0 = listOptions(inp)[0];
         if (o0) return o0.getAttribute("aria-selected") === "true";
         const field = inp && inp.closest('[class*="selectFieldContainer"]');
@@ -254,7 +270,7 @@ async function __discordOnboarding(opts) {
     // Wait until the question advances, the questionnaire closes, or the guild
     // (a different server's onboarding) changes — whichever comes first.
     const waitNext = async (prevCur, prevGuild) => {
-        for (let i = 0; i < 35; i++) {
+        for (let i = 0; i < 35 && !outOfTime(); i++) {
             await sleep(200);
             const s = readState();
             if (!s.onboarding || s.current !== prevCur || s.guild !== prevGuild) return s;
@@ -270,7 +286,7 @@ async function __discordOnboarding(opts) {
     // budget with plenty of headroom for the rest of the questionnaire walk.
     let init = readState();
     if (!init.onboarding && !rulesScreen()) {
-        for (let i = 0; i < 10; i++) {
+        for (let i = 0; i < 10 && !outOfTime(); i++) {
             await sleep(1000);
             init = readState();
             if (init.onboarding || rulesScreen()) break;
@@ -284,6 +300,7 @@ async function __discordOnboarding(opts) {
     let handled = 0, prevCur = -1, prevGuild = startGuild;
 
     for (let guard = 0; guard < MAX_Q; guard++) {
+        if (outOfTime()) { log.push("Out of time budget — stopping with the log so far."); break; }
         const st = readState();
         if (!st.onboarding) { log.push("Onboarding closed — no more questions."); break; }
         if (!ALL_SERVERS && st.guild !== startGuild) {
@@ -299,7 +316,7 @@ async function __discordOnboarding(opts) {
         if (st.required || ANSWER_OPTIONAL) {
             const sel = await selectFirstOption();
             // Give the advance button a moment to morph away from "Skip".
-            for (let i = 0; i < 16; i++) { await sleep(150); if ((advText() || "") !== "Skip") break; }
+            for (let i = 0; i < 16 && !outOfTime(); i++) { await sleep(150); if ((advText() || "") !== "Skip") break; }
             const selected = firstSelected();
             const tag = st.required ? "[required]" : "[optional]";
             log.push("Q" + st.current + "/" + st.total + " " + tag +
@@ -323,7 +340,7 @@ async function __discordOnboarding(opts) {
     }
 
     // After the Q&A loop Discord may land on the rules screen before closing onboarding.
-    if (rulesScreen()) {
+    if (rulesScreen() && !outOfTime()) {
         log.push("Rules screen after Q&A — clicking Finish.");
         await finishRules();
     }
