@@ -72,17 +72,45 @@ async function __discordOnboarding(opts) {
     };
     const advText = () => { const a = advBtn(); return a ? (a.textContent || "").trim() : null; };
 
+    // advBtn() matches `[role="button"]` too, and a div carries its disabled
+    // state as aria-disabled — `.disabled` is undefined there.
+    const isDisabled = (el) => !!el && (el.disabled === true ||
+        el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true");
+
     // Detect the "One last step! Read & Agree to Server Rules" screen.
     // It appears after the Q&A flow but has no "Question X of Y" heading.
     const rulesScreen = () =>
         !!guildOf() && /Read\s*&\s*Agree/i.test(document.body ? document.body.textContent || "" : "");
 
-    // Nudge every overflowing scroller on screen down by one viewport. Returns
-    // whether anything actually moved — false when nothing overflows (a tall
-    // window shows the whole rules list, so there is nothing to scroll).
+    // Leaf element holding some onboarding caption, e.g. "Question 1 of 3".
+    // Uses TreeWalker (text nodes only) instead of querySelectorAll("*") to avoid
+    // scanning the full element tree on every readState / waitNext poll.
+    const captionEl = (re) => {
+        const walker = document.createTreeWalker(document.body || document, NodeFilter.SHOW_TEXT);
+        let node;
+        while ((node = walker.nextNode())) {
+            if (re.test((node.textContent || "").trim())) return node.parentElement;
+        }
+        return null;
+    };
+
+    // Nearest ancestor of `from` that contains something matching `sel` — the
+    // onboarding overlay, reached from a caption inside it. The cap keeps a
+    // screen that has no such descendant from resolving to <body>.
+    const scopeAround = (from, sel) => {
+        for (let el = from, i = 0; el && i < 10; i++, el = el.parentElement)
+            if (el.querySelector(sel)) return el;
+        return null;
+    };
+
+    // Scroll the rules list down by one viewport; returns whether it moved.
+    // Scoped to the rules overlay: a synthetic `scroll` on the message list
+    // behind it would drive Discord's history pagination and read state.
     const scrollStep = () => {
+        const root = scopeAround(captionEl(/Read\s*&\s*Agree/i), '[class*="scroller"]');
+        if (!root) return false;
         let moved = false;
-        for (const s of document.querySelectorAll('[class*="scroller"]')) {
+        for (const s of root.querySelectorAll('[class*="scroller"]')) {
             if (s.scrollHeight <= s.clientHeight + 20 || s.clientHeight <= 100) continue;
             const before = s.scrollTop;
             s.scrollTop = Math.min(s.scrollHeight, before + s.clientHeight);
@@ -92,35 +120,30 @@ async function __discordOnboarding(opts) {
         return moved;
     };
 
-    // Wait for the rules screen's Finish button to become clickable, reacting to
-    // the button's own state rather than assuming any particular gate. It may be
-    // enabled immediately (short rules list, or a window tall enough that there is
-    // nothing to scroll); when it is not, the usual gate is the unread rules list
-    // ("You must finish reading the rules to join"), so each poll also nudges any
-    // scroller — a no-op when nothing overflows. Anything else that enables it on
-    // its own (a late render, a slow request) is picked up by the same poll.
+    // Poll ~8s for Finish to enable, nudging the rules list each tick: the usual
+    // gate is the unread rules ("You must finish reading the rules to join"), but
+    // the button can also enable on its own (short list, tall window, late render).
     const waitFinishEnabled = async () => {
         let scrolled = false;
         for (let i = 0; i < 40; i++) {
             const fin = advBtn();
-            if (fin && !fin.disabled) return { ok: true, scrolled };
+            if (fin && !isDisabled(fin)) return { ok: true, scrolled };
             if (scrollStep()) scrolled = true;
             await sleep(200);
         }
-        const fin = advBtn();
-        return { ok: !!fin && !fin.disabled, scrolled };
+        return { ok: !isDisabled(advBtn()) && !!advBtn(), scrolled };
     };
 
     // Click Finish on the rules screen and wait for the URL to leave /onboarding.
     const finishRules = async () => {
         let fin = advBtn();
         if (!fin) { log.push("Rules screen: no Finish button found — cannot complete."); return; }
-        if (fin.disabled) {
+        if (isDisabled(fin)) {
             const st = await waitFinishEnabled();
             log.push("Rules screen: Finish started disabled — waited for it to enable (enabled=" +
                 st.ok + ", scrolled=" + st.scrolled + ").");
             fin = advBtn();
-            if (!fin || fin.disabled) { log.push("Rules screen: Finish still disabled — cannot complete."); return; }
+            if (!fin || isDisabled(fin)) { log.push("Rules screen: Finish still disabled — cannot complete."); return; }
         }
         fire(fin);
         handled++;
@@ -128,18 +151,7 @@ async function __discordOnboarding(opts) {
         log.push("Rules screen: Finish clicked — onboarding complete.");
     };
 
-    // Leaf element holding the "Question X of Y" caption.
-    // Uses TreeWalker (text nodes only) instead of querySelectorAll("*") to avoid
-    // scanning the full element tree on every readState / waitNext poll.
-    const qHead = () => {
-        const walker = document.createTreeWalker(document.body || document, NodeFilter.SHOW_TEXT);
-        let node;
-        while ((node = walker.nextNode())) {
-            if (/^Question\s+\d+\s+of\s+\d+$/i.test((node.textContent || "").trim()))
-                return node.parentElement;
-        }
-        return null;
-    };
+    const qHead = () => captionEl(/^Question\s+\d+\s+of\s+\d+$/i);
 
     const readState = () => {
         const q = qHead();
@@ -167,21 +179,32 @@ async function __discordOnboarding(opts) {
         fire(el);
     };
 
-    // Dropdown-style question: a visible "Select..." combobox input. Its listbox
-    // renders in a portal outside the field, so options are looked up globally.
+    // Dropdown-style question: a visible "Select..." combobox input, scoped to the
+    // question — Discord's own search box carries role="combobox" too.
     const comboInput = () => {
-        for (const el of document.querySelectorAll('input[role="combobox"]')) {
+        const root = scopeAround(qHead(), 'input[role="combobox"]');
+        if (!root) return null;
+        for (const el of root.querySelectorAll('input[role="combobox"]')) {
             const r = el.getBoundingClientRect();
             if (r.width > 0 && r.height > 0) return el;
         }
         return null;
     };
-    const listOptions = () => [...document.querySelectorAll('[role="option"]')];
+
+    // The listbox renders in a portal, so it is reached through the id the input
+    // points at. Discord mounts no node carrying that id — the options do, as
+    // their own id prefix. Only an input naming no listbox falls back to a
+    // document-wide scan; naming one that is absent means it is not open yet.
+    const listOptions = (inp) => {
+        const id = inp && (inp.getAttribute("aria-controls") || inp.getAttribute("aria-owns"));
+        if (!id) return [...document.querySelectorAll('[role="option"]')];
+        const box = document.getElementById(id);
+        if (box) return [...box.querySelectorAll('[role="option"]')];
+        return [...document.querySelectorAll('[role="option"]')].filter((o) => (o.id || "").indexOf(id) === 0);
+    };
 
     // Expand the dropdown and pick its first option. Discord's combobox keeps the
-    // listbox open after a pick (it's multi-select), which is fine — the advance
-    // button is clicked by event dispatch, not by hit-testing, so the open popover
-    // cannot occlude it.
+    // listbox open after a pick — it is multi-select.
     const selectFirstDropdownOption = async () => {
         const inp = comboInput();
         if (!inp) return { ok: false, reason: "no options found" };
@@ -189,11 +212,11 @@ async function __discordOnboarding(opts) {
             try { inp.focus(); } catch (e) { /* ignore */ }
             fire(inp);
         }
-        let opts = [];
-        for (let i = 0; i < 20; i++) { opts = listOptions(); if (opts.length) break; await sleep(150); }
-        if (!opts.length) return { ok: false, reason: "dropdown did not expand" };
-        if (opts[0].getAttribute("aria-selected") === "true") return { ok: true, already: true };
-        fireInside(opts[0]);
+        let items = [];
+        for (let i = 0; i < 20; i++) { items = listOptions(inp); if (items.length) break; await sleep(150); }
+        if (!items.length) return { ok: false, reason: "dropdown did not expand" };
+        if (items[0].getAttribute("aria-selected") === "true") return { ok: true, already: true };
+        fireInside(items[0]);
         for (let i = 0; i < 20; i++) {
             await sleep(150);
             if (firstSelected() || (advText() || "") !== "Skip") break;
@@ -212,15 +235,20 @@ async function __discordOnboarding(opts) {
         return { ok: true };
     };
 
-    // Whether this question now has an answer, for either widget. For a dropdown
-    // whose listbox has collapsed, the picked value survives as a tag in the field.
+    // Whether this question now has an answer, for either widget. A dropdown whose
+    // listbox has collapsed leaves its pick as a removable tag in the field; text
+    // alone is not proof, since the unanswered field can render its placeholder.
     const firstSelected = () => {
         const w0 = optionWraps()[0];
         if (w0) return /selected/i.test(w0.className);
-        const o0 = listOptions()[0];
+        const inp = comboInput();
+        const o0 = listOptions(inp)[0];
         if (o0) return o0.getAttribute("aria-selected") === "true";
-        const field = document.querySelector('[class*="selectFieldContainer"]');
-        return !!field && !!(field.textContent || "").trim();
+        const field = inp && inp.closest('[class*="selectFieldContainer"]');
+        if (!field) return false;
+        if (field.querySelector('[class*="tag"]')) return true;
+        const txt = (field.textContent || "").trim();
+        return !!txt && txt !== (inp.getAttribute("placeholder") || "").trim();
     };
 
     // Wait until the question advances, the questionnaire closes, or the guild

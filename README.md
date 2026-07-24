@@ -136,7 +136,11 @@ press `Ctrl+R` — `discord_status` should then report the plugin connected.
   auto-complete the *"Question X of Y"* onboarding questionnaire shown right
   after joining a community server. Required questions get their first option
   selected then Next; optional questions are Skipped (`answerOptional: true` to
-  answer them too). Scoped to the current server unless `allServers: true`
+  answer them too). Handles both answer widgets — the option-button grid and a
+  *"Select…"* dropdown (expanded first, then its first entry picked) — and the
+  *"Read & Agree to Server Rules"* gate, whose Finish button stays disabled
+  until the rules list has been read to the end. Scoped to the current server
+  unless `allServers: true`
   (Discord chains several freshly-joined servers' onboarding back-to-back).
   Safe no-op (reports it) when no onboarding screen is up. Returns a
   per-question log.
