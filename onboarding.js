@@ -96,8 +96,11 @@ async function __discordOnboarding(opts) {
         while ((node = walker.nextNode())) {
             if (re.test((node.textContent || "").trim())) return node.parentElement;
         }
+        // Onboarding always renders in the modal, so the split-caption scan stays
+        // inside it — the whole-body scan only runs when no dialog is mounted.
+        const dialog = document.querySelector('[role="dialog"]');
         let deepest = null;
-        for (const el of (document.body || document).querySelectorAll("*")) {
+        for (const el of (dialog || document.body || document).querySelectorAll("*")) {
             if (!re.test((el.textContent || "").trim())) continue;
             if (!deepest || deepest.contains(el)) deepest = el;
         }
@@ -115,7 +118,6 @@ async function __discordOnboarding(opts) {
         return null;
     };
 
-    // Scroll the rules list down by one viewport; returns whether it moved.
     // Scoped to the rules overlay: a synthetic `scroll` on the message list
     // behind it would drive Discord's history pagination and read state.
     const scrollStep = () => {
@@ -128,6 +130,18 @@ async function __discordOnboarding(opts) {
             s.scrollTop = Math.min(s.scrollHeight, before + s.clientHeight);
             s.dispatchEvent(new Event("scroll", { bubbles: true }));
             if (s.scrollTop > before) moved = true;
+        }
+        return moved;
+    };
+
+    // Drive the rules list to its end; returns whether anything moved. Stops as
+    // soon as a step doesn't scroll (already at the bottom, or nothing to scroll).
+    const scrollToEnd = async () => {
+        let moved = false;
+        for (let i = 0; i < 40 && !outOfTime(); i++) {
+            if (!scrollStep()) break;
+            moved = true;
+            await sleep(120);
         }
         return moved;
     };
@@ -147,6 +161,13 @@ async function __discordOnboarding(opts) {
         return { ok: !!fin && !isDisabled(fin), scrolled };
     };
 
+    // Wait up to 6s for the click to take (URL leaves /onboarding), unless the
+    // time budget runs out first.
+    const waitLeftOnboarding = async () => {
+        for (let i = 0; i < 30 && !outOfTime(); i++) { await sleep(200); if (!guildOf()) return true; }
+        return false;
+    };
+
     // Click Finish on the rules screen and wait for the URL to leave /onboarding.
     const finishRules = async () => {
         let fin = advBtn();
@@ -160,10 +181,24 @@ async function __discordOnboarding(opts) {
         }
         fire(fin);
         handled++;
-        let left = false;
-        for (let i = 0; i < 30 && !outOfTime(); i++) { await sleep(200); if (!guildOf()) { left = true; break; } }
-        log.push(left ? "Rules screen: Finish clicked — onboarding complete."
-            : "Rules screen: Finish clicked but onboarding is still on screen after 6s — not complete.");
+        if (await waitLeftOnboarding()) { log.push("Rules screen: Finish clicked — onboarding complete."); return; }
+
+        // The click didn't take: the button looked enabled but the rules were
+        // unread (Finish gates a click without disabling), the portal swallowed
+        // it, or aria-disabled hadn't landed. Scroll the rules to the end — which
+        // waitFinishEnabled skips while the button already reads enabled — then
+        // click once more before giving up.
+        if (rulesScreen() && !outOfTime()) {
+            const scrolled = await scrollToEnd();
+            fin = advBtn();
+            if (fin && !isDisabled(fin)) {
+                fire(fin);
+                log.push("Rules screen: first Finish click did not take — scrolled rules to end and retried (scrolled=" +
+                    scrolled + ").");
+                if (await waitLeftOnboarding()) { log.push("Rules screen: retry succeeded — onboarding complete."); return; }
+            }
+        }
+        log.push("Rules screen: Finish clicked but onboarding is still on screen — not complete.");
     };
 
     const qHead = () => captionEl(/^Question\s+\d+\s+of\s+\d+$/i);
@@ -183,9 +218,6 @@ async function __discordOnboarding(opts) {
 
     const optionWraps = () => [...document.querySelectorAll('[class*="optionButtonWrapper"]')];
 
-    // Click the deepest painted node inside `box` (see fire()'s note on React's
-    // delegated handlers), falling back to the box itself when the centre point
-    // is covered by something outside it.
     const fireInside = (box) => {
         const r = box.getBoundingClientRect();
         const cx = Math.round(r.left + r.width / 2), cy = Math.round(r.top + r.height / 2);
@@ -218,8 +250,7 @@ async function __discordOnboarding(opts) {
         return [...document.querySelectorAll('[role="option"]')].filter((o) => (o.id || "").indexOf(id) === 0);
     };
 
-    // Expand the dropdown and pick its first option. Discord's combobox keeps the
-    // listbox open after a pick — it is multi-select.
+    // Discord's combobox keeps the listbox open after a pick — it is multi-select.
     const selectFirstDropdownOption = async () => {
         const inp = comboInput();
         if (!inp) return { ok: false, reason: "no options found" };
@@ -258,9 +289,13 @@ async function __discordOnboarding(opts) {
         if (w0) return /selected/i.test(w0.className);
         const inp = comboInput();
         if (!inp) return false;
-        const o0 = listOptions(inp)[0];
+        // Only trust the listbox while the input still names it; a collapsed
+        // dropdown drops aria-controls, and listOptions() would then scan the
+        // whole document — fall through to the tag/placeholder check instead.
+        const listboxId = inp.getAttribute("aria-controls") || inp.getAttribute("aria-owns");
+        const o0 = listboxId ? listOptions(inp)[0] : null;
         if (o0) return o0.getAttribute("aria-selected") === "true";
-        const field = inp && inp.closest('[class*="selectFieldContainer"]');
+        const field = inp.closest('[class*="selectFieldContainer"]');
         if (!field) return false;
         if (field.querySelector('[class*="tag"]')) return true;
         const txt = (field.textContent || "").trim();

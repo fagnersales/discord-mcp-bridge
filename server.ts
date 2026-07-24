@@ -371,9 +371,7 @@ mcp.registerTool("discord_onboarding", {
     let src: string;
     try { src = readFileSync(ONBOARDING_PATH, "utf8"); }
     catch (e) { return text("Could not load onboarding script (" + ONBOARDING_PATH + "): " + errMsg(e), true); }
-    // Onboarding can take several seconds per question; give it a generous
-    // renderer budget (the daemon clamps eval timeouts to ≤300s). The script
-    // stops itself 15s earlier — the per-question log lives only in the
+    // The script stops itself 15s early: the per-question log lives only in the
     // renderer, so a killed eval would return none of it.
     const RENDERER_MS = 120_000;
     const opts = {
