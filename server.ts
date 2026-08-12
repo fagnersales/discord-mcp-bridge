@@ -112,10 +112,17 @@ function ensureDaemon(): Promise<void> {
         if (await daemonHealthy()) return;
         log("daemon not running — spawning it detached");
         try {
-            // `setsid` puts the daemon in its own session so it survives this
-            // MCP server (and Claude Code) being killed. A second spawn loses
-            // the port race and exits — the daemon stays a singleton.
-            Bun.spawn(["setsid", process.execPath, DAEMON_PATH], {
+            // The daemon must survive this MCP server (and Claude Code) being
+            // killed. `setsid` gives it its own session on Linux; macOS ships
+            // no setsid, so there the shell backgrounds it (`&`) and exits,
+            // orphaning the daemon to launchd — same effect. A second spawn
+            // loses the port race and exits — the daemon stays a singleton.
+            const hasSetsid = Bun.which("setsid") !== null;
+            const cmd = hasSetsid
+                ? ["setsid", process.execPath, DAEMON_PATH]
+                : ["/bin/sh", "-c",
+                   `nohup ${JSON.stringify(process.execPath)} ${JSON.stringify(DAEMON_PATH)} >/dev/null 2>&1 &`];
+            Bun.spawn(cmd, {
                 stdin: "ignore", stdout: "ignore", stderr: "ignore",
             }).unref();
         } catch (e) {
