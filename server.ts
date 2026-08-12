@@ -1005,6 +1005,57 @@ mcp.registerTool("discord_emoji", {
     return runInRenderer(code, 4);
 });
 
+mcp.registerTool("discord_sticker", {
+    description:
+        "List/search custom server stickers, read from the renderer's StickersStore (no " +
+        "plugin helper needed). Returns each as `{ id, name, tags, description, formatType, " +
+        "guildId, guildName, url }` — `url` is the media-proxy image (PNG/APNG/GIF; Lottie " +
+        "stickers have no image url, url is null). The store fills lazily: guilds the user " +
+        "browsed recently are present; if a guild comes back empty, open its sticker picker " +
+        "in Discord once and retry. Pass `query` to filter on name/tags, `guildId` to " +
+        "narrow to one guild.",
+    inputSchema: {
+        query: z.string().optional().describe("Case-insensitive substring filter on sticker name/tags."),
+        guildId: z.string().optional().describe("Narrow to one guild."),
+        limit: z.number().int().min(1).max(200).optional().describe("Cap on results (default 25)."),
+    },
+}, async ({ query, guildId, limit }) => {
+    const argJson = JSON.stringify({ query: query ?? null, guildId: guildId ?? null, limit: limit ?? 25 });
+    return runInRenderer(`(() => {
+        const { query, guildId, limit } = ${argJson};
+        const store = Vencord.Webpack.findStore("StickersStore");
+        if (!store) throw new Error("StickersStore not found in the renderer");
+        const GuildStore = Vencord.Webpack.findStore("GuildStore");
+        const packs = guildId
+            ? [[guildId, store.getStickersByGuildId(guildId) ?? []]]
+            : [...store.getAllGuildStickers().entries()];
+        const q = (query ?? "").toLowerCase();
+        // format_type: 1 PNG, 2 APNG (media proxy renders .png), 3 Lottie (no image), 4 GIF
+        const EXT = { 1: "png", 2: "png", 4: "gif" };
+        const out = [];
+        let truncated = false;
+        for (const [gid, stickers] of packs) {
+            for (const s of stickers) {
+                if (q && !((s.name + " " + (s.tags ?? "")).toLowerCase().includes(q))) continue;
+                if (out.length >= limit) { truncated = true; break; }
+                const ext = EXT[s.format_type];
+                out.push({
+                    id: s.id,
+                    name: s.name,
+                    tags: s.tags ?? "",
+                    description: s.description ?? "",
+                    formatType: s.format_type,
+                    guildId: gid,
+                    guildName: GuildStore?.getGuild?.(gid)?.name ?? null,
+                    url: ext ? "https://media.discordapp.net/stickers/" + s.id + "." + ext : null,
+                });
+            }
+            if (truncated) break;
+        }
+        return { count: out.length, truncated, stickers: out };
+    })()`, 5);
+});
+
 mcp.registerTool("discord_unread", {
     description:
         "List channels with unread messages — the \"what did I miss?\" lookup. Always " +
