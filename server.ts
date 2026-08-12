@@ -5,7 +5,7 @@
  * A thin MCP stdio server. Claude Code spawns one of these per session.
  *
  * It owns NO port. Every tool call is proxied over HTTP to the long-lived
- * daemon (daemon.ts) that owns :8787 and the Discord connection. On startup it
+ * daemon (daemon.ts) that owns :8788 and the Discord connection. On startup it
  * ensures the daemon is running, spawning it detached (via `setsid`) if not.
  *
  * This decouples the two roles that used to live in one file: any number of
@@ -23,7 +23,7 @@ import { appendFileSync, readFileSync, writeFileSync, existsSync, mkdirSync } fr
 import { basename, extname, dirname, join } from "path";
 import { homedir } from "os";
 
-const PORT = 8787;
+const PORT = 8788;
 const TOKEN = "vc-debug-bridge-2f9a4c1e";
 const BASE = `http://127.0.0.1:${PORT}`;
 const DAEMON_PATH = new URL("./daemon.ts", import.meta.url).pathname;
@@ -1054,6 +1054,39 @@ mcp.registerTool("discord_sticker", {
         }
         return { count: out.length, truncated, stickers: out };
     })()`, 5);
+});
+
+mcp.registerTool("discord_logo", {
+    description:
+        "Get a guild's logo (server icon) plus its other brand imagery — banner and " +
+        "invite splash — as ready-to-fetch CDN URLs, read from the renderer's GuildStore. " +
+        "Returns `{ guildId, name, icon, banner, splash }` where each image field is a " +
+        "`https://cdn.discordapp.com/...` URL (animated assets resolve to .gif) or null " +
+        "when the guild doesn't have that asset. Find the guildId via `discord_guilds`.",
+    inputSchema: {
+        guildId: z.string().regex(/^\d{15,25}$/).describe("Guild/server ID (from discord_guilds)."),
+        size: z.number().int().min(16).max(4096).optional().describe("Requested image size in px, power of two (default 1024)."),
+    },
+}, async ({ guildId, size }) => {
+    const argJson = JSON.stringify({ guildId, size: size ?? 1024 });
+    return runInRenderer(`(() => {
+        const { guildId, size } = ${argJson};
+        const store = Vencord.Webpack.findStore("GuildStore");
+        if (!store) throw new Error("GuildStore not found in the renderer");
+        const g = store.getGuild(guildId);
+        if (!g) throw new Error("Not a member of guild " + guildId + " (or bad id) — check discord_guilds.");
+        const CDN = "https://cdn.discordapp.com";
+        const ext = (hash) => hash.startsWith("a_") ? "gif" : "png";
+        const asset = (kind, hash) =>
+            hash ? CDN + "/" + kind + "/" + guildId + "/" + hash + "." + ext(hash) + "?size=" + size : null;
+        return {
+            guildId,
+            name: g.name,
+            icon: asset("icons", g.icon),
+            banner: asset("banners", g.banner),
+            splash: asset("splashes", g.splash),
+        };
+    })()`, 3);
 });
 
 mcp.registerTool("discord_unread", {
