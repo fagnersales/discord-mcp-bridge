@@ -30,7 +30,7 @@ import { useEffect, useState } from "@webpack/common";
 import type { PropsWithChildren } from "react";
 
 const TOKEN = "vc-debug-bridge-2f9a4c1e";          // must match the MCP server
-const BASES = ["http://localhost:8787", "http://127.0.0.1:8787"];
+const BASES = ["http://localhost:8788", "http://127.0.0.1:8788"];
 const POLL_ABORT_MS = 35_000;                       // > the server's 25s long-poll hold
 const BACKOFF_MS = 2_000;                           // wait after a network error
 const CONSOLE_LIMIT = 200;
@@ -1663,10 +1663,14 @@ interface OpenChannelArgs {
 }
 
 /**
- * Switch Discord to a channel — dispatches the same action the sidebar does
- * (`ChannelActions.selectChannel`). For DMs guildId is null; for guild
- * channels we look it up from ChannelStore so the caller need not provide it.
- * `messageId` scroll-jumps to that message (Discord handles the
+ * Switch Discord to a channel — navigates the router the way a channel link
+ * does (`ChannelRouter.transitionToChannel` / `NavigationRouter.transitionTo`),
+ * so the whole app follows: sidebar, guild header, route. The old
+ * `ChannelActions.selectChannel` dispatch flipped `SelectedChannelStore` and
+ * the chat pane but could leave the route (and thus the sidebar) on `@me`,
+ * rendering a guild channel next to the DM list. For DMs guildId is null; for
+ * guild channels we look it up from ChannelStore so the caller need not
+ * provide it. `messageId` scroll-jumps to that message (Discord handles the
  * fetch-around-and-highlight flow).
  */
 async function bridgeOpenChannel(args: OpenChannelArgs): Promise<unknown> {
@@ -1679,18 +1683,23 @@ async function bridgeOpenChannel(args: OpenChannelArgs): Promise<unknown> {
     const GuildStore = W.findByProps("getGuild", "getGuilds");
     const UserStore = W.findByProps("getCurrentUser", "getUser");
 
-    if (!ChannelActions?.selectChannel)
-        throw new Error("ChannelActions.selectChannel not found — webpack module shape may have changed.");
-
     const channel = ChannelStore?.getChannel?.(args.channelId);
     if (!channel) throw new Error("Channel not found in ChannelStore: " + args.channelId);
 
     const guildId = channel.guild_id || null;
-    ChannelActions.selectChannel({
-        guildId,
-        channelId: args.channelId,
-        messageId: args.messageId,
-    });
+    const { ChannelRouter, NavigationRouter } = W.Common ?? {};
+    if (args.messageId) {
+        if (!NavigationRouter?.transitionTo)
+            throw new Error("NavigationRouter not found — webpack module shape may have changed.");
+        NavigationRouter.transitionTo(`/channels/${guildId ?? "@me"}/${args.channelId}/${args.messageId}`);
+    } else if (ChannelRouter?.transitionToChannel) {
+        ChannelRouter.transitionToChannel(args.channelId);
+    } else if (ChannelActions?.selectChannel) {
+        // Legacy fallback: flips the chat pane but may leave the sidebar on @me.
+        ChannelActions.selectChannel({ guildId, channelId: args.channelId });
+    } else {
+        throw new Error("No channel navigation module found — webpack module shape may have changed.");
+    }
 
     // Selection dispatches synchronously, but the renderer redraw takes a
     // frame or two. Poll briefly so callers get an accurate "did it flip?".
@@ -3177,7 +3186,7 @@ export default definePlugin({
         consoleBuffer.length = 0;
         installConsoleCapture();
         (globalThis as any).$discordBridge = {
-            version: 31,
+            version: 32,
             console: consoleBuffer,
             isConnected: () => connected,
             isActive: () => settings.store.bridgeActive,
