@@ -746,6 +746,7 @@ async function bridgeGetView(args: GetViewArgs = {}): Promise<unknown> {
             } : null,
             content: msg.content || "",
         };
+        if (!out.content && msg.components?.length) out.content = extractComponentText(msg.components);
         const edited = tsIso(msg.editedTimestamp);
         if (edited) out.edited = edited;
 
@@ -758,6 +759,8 @@ async function bridgeGetView(args: GetViewArgs = {}): Promise<unknown> {
                 width: a.width, height: a.height,
             }));
         }
+        const viewCompMedia = msg.components?.length ? extractComponentMedia(msg.components) : [];
+        if (viewCompMedia.length) out.componentMedia = viewCompMedia;
 
         if (msg.messageReference?.message_id) {
             const refId = msg.messageReference.message_id;
@@ -1044,10 +1047,69 @@ function getAuthToken(W: any): string {
     return tok;
 }
 
+/* ---------------------------------------- Components V2 extraction ------- */
+// Component types: 1 ActionRow, 9 Section (children + accessory), 10 TextDisplay
+// (content), 11 Thumbnail (media), 12 MediaGallery (items[].media), 13 File
+// (file), 17 Container (children). REST gives snake_case; MessageStore records
+// may be camelCase — handle both.
+
+function walkComponents(components: any[], visit: (c: any) => void): void {
+    for (const c of components ?? []) {
+        if (!c || typeof c !== "object") continue;
+        visit(c);
+        if (Array.isArray(c.components)) walkComponents(c.components, visit);
+        if (c.accessory) visit(c.accessory);
+    }
+}
+
+/**
+ * Media buried in a Components V2 message — media galleries, thumbnails, file
+ * components. Bots increasingly post art this way instead of embeds or
+ * attachments; without this, such messages look image-less to every tool.
+ */
+function extractComponentMedia(components: any[]): any[] {
+    const media: any[] = [];
+    const push = (kind: string, m: any, description?: string) => {
+        const url = m?.url ?? m?.proxy_url ?? m?.proxyUrl;
+        if (!url || !/^https?:/i.test(url)) return;
+        media.push({
+            kind,
+            url,
+            proxyUrl: m.proxy_url ?? m.proxyUrl ?? null,
+            contentType: m.content_type ?? m.contentType ?? null,
+            width: m.width ?? null,
+            height: m.height ?? null,
+            ...(description ? { description } : {}),
+        });
+    };
+    walkComponents(components, (c) => {
+        if (c.type === 12) for (const item of c.items ?? []) push("gallery", item?.media, item?.description || undefined);
+        else if (c.type === 11) push("thumbnail", c.media);
+        else if (c.type === 13) push("file", c.file);
+    });
+    return media;
+}
+
+/**
+ * Visible text of a Components V2 message (TextDisplay blocks, render order).
+ * V2 messages have empty `content` — this is their real text; serializers use
+ * it as the content fallback so these messages stop reading as blank.
+ */
+function extractComponentText(components: any[]): string {
+    const parts: string[] = [];
+    walkComponents(components, (c) => {
+        if (c.type === 10 && typeof c.content === "string" && c.content) parts.push(c.content);
+    });
+    return parts.join("\n");
+}
+
 /** Raw REST message → caller-facing projection driven by `select`. `id` always present. */
 function projectMessage(msg: any, select: Set<string>): any {
     const out: any = { id: msg.id };
-    if (select.has("content")) out.content = msg.content || "";
+    if (select.has("content")) {
+        out.content = msg.content || "";
+        if (!out.content && msg.components?.length) out.content = extractComponentText(msg.components);
+    }
     if (select.has("timestamp")) out.timestamp = msg.timestamp || snowflakeToIso(msg.id);
     if (select.has("author") && msg.author) out.author = {
         id: msg.author.id,
@@ -1055,14 +1117,18 @@ function projectMessage(msg: any, select: Set<string>): any {
         name: msg.author.global_name ?? msg.author.globalName ?? msg.author.username,
         bot: !!msg.author.bot,
     };
-    if (select.has("attachments") && msg.attachments?.length) {
-        out.attachments = msg.attachments.map((a: any) => ({
-            name: a.filename || a.name,
-            url: a.url,
-            size: a.size,
-            contentType: a.content_type || a.contentType,
-            width: a.width, height: a.height,
-        }));
+    if (select.has("attachments")) {
+        if (msg.attachments?.length) {
+            out.attachments = msg.attachments.map((a: any) => ({
+                name: a.filename || a.name,
+                url: a.url,
+                size: a.size,
+                contentType: a.content_type || a.contentType,
+                width: a.width, height: a.height,
+            }));
+        }
+        const compMedia = msg.components?.length ? extractComponentMedia(msg.components) : [];
+        if (compMedia.length) out.componentMedia = compMedia;
     }
     if (select.has("replyTo") && msg.message_reference?.message_id) {
         out.replyTo = {
@@ -2482,23 +2548,35 @@ async function bridgeAttachment(args: AttachmentArgs): Promise<unknown> {
     if (!msg)
         throw new Error(`messageId ${args.messageId} not found in channel ${channelId}.`);
 
-    const attachments: any[] = msg.attachments || [];
-    if (!attachments.length)
-        throw new Error(`message ${args.messageId} has no attachments.`);
+    // Unified index space: regular attachments first, then Components V2
+    // media (galleries/thumbnails/files) — bots often ship art only there.
+    const entries = [
+        ...(msg.attachments || []).map((a: any) => ({
+            source: "attachment",
+            name: a.filename || a.name,
+            url: a.url,
+            proxyUrl: a.proxy_url || a.proxyUrl || null,
+            size: a.size ?? null,
+            contentType: a.content_type || a.contentType || null,
+            width: a.width ?? null,
+            height: a.height ?? null,
+        })),
+        ...(msg.components?.length ? extractComponentMedia(msg.components) : []).map((m: any) => ({
+            source: `component-${m.kind}`,
+            name: m.description || String(m.url).split("?")[0].split("/").pop() || "media",
+            url: m.url,
+            proxyUrl: m.proxyUrl,
+            size: null,
+            contentType: m.contentType,
+            width: m.width,
+            height: m.height,
+        })),
+    ];
+    if (!entries.length)
+        throw new Error(`message ${args.messageId} has no attachments or component media.`);
 
-    const idx = Math.max(0, Math.min(attachments.length - 1, args.index ?? 0));
-    const a = attachments[idx];
-    return {
-        index: idx,
-        attachmentCount: attachments.length,
-        name: a.filename || a.name,
-        url: a.url,
-        proxyUrl: a.proxy_url || a.proxyUrl || null,
-        size: a.size,
-        contentType: a.content_type || a.contentType || null,
-        width: a.width ?? null,
-        height: a.height ?? null,
-    };
+    const idx = Math.max(0, Math.min(entries.length - 1, args.index ?? 0));
+    return { index: idx, attachmentCount: entries.length, ...entries[idx] };
 }
 
 /* ----------------------- reply-chain walker + resolveMessage --------------- */
@@ -2514,6 +2592,8 @@ const renderUserName = (u: any) => u?.global_name ?? u?.globalName ?? u?.usernam
 function compactMessage(msg: any): any {
     const tsIso = (t: any) =>
         typeof t?.toISOString === "function" ? t.toISOString() : (t ? String(t) : null);
+    const content = msg.content
+        || (msg.components?.length ? extractComponentText(msg.components) : "");
     return {
         id: msg.id,
         timestamp: tsIso(msg.timestamp) ?? msg.timestamp ?? null,
@@ -2523,7 +2603,7 @@ function compactMessage(msg: any): any {
             name: renderUserName(msg.author),
             bot: !!msg.author.bot,
         } : null,
-        content: (msg.content || "").slice(0, 800),
+        content: content.slice(0, 800),
     };
 }
 
@@ -2972,6 +3052,7 @@ function projectIncomingMessage(msg: any): any {
             bot: !!msg.author.bot,
         } : null,
     };
+    if (!out.content && msg.components?.length) out.content = extractComponentText(msg.components);
     if (msg.attachments?.length) {
         out.attachments = msg.attachments.map((a: any) => ({
             name: a.filename || a.name,
@@ -2980,6 +3061,8 @@ function projectIncomingMessage(msg: any): any {
             size: a.size,
         }));
     }
+    const waitCompMedia = msg.components?.length ? extractComponentMedia(msg.components) : [];
+    if (waitCompMedia.length) out.componentMedia = waitCompMedia;
     const refId = msg.message_reference?.message_id
         ?? msg.messageReference?.message_id
         ?? msg.referenced_message?.id;

@@ -12,7 +12,7 @@ runtime (webpack modules, the DOM, minified class names) instead of guessing.
 The bridge is split so the MCP tools **always** connect, no matter how many
 Claude Code sessions are open:
 
-1. **`daemon.ts`** — owns `0.0.0.0:8787` and the long-poll connection to the
+1. **`daemon.ts`** — owns `0.0.0.0:8788` and the long-poll connection to the
    Vencord plugin. Long-lived and a **singleton**: only one process can bind
    the port; a second daemon loses the race and exits. Started **detached**
    (`setsid`) so it survives the Claude Code session that spawned it — and a
@@ -65,6 +65,20 @@ claude mcp add discord-bridge -s user -- "$(which bun)" "$PWD/server.ts"
 
 Build & deploy Vencord, enable the **DiscordMCP** plugin in Vencord settings,
 press `Ctrl+R` — `discord_status` should then report the plugin connected.
+
+For Vesktop on macOS, "deploy" means copying the built dist into the dir
+Vesktop actually loads Vencord from, then reloading:
+
+```bash
+cp ~/Vencord/dist/* "$HOME/Library/Application Support/vesktop/sessionData/vencordFiles/"
+```
+
+Keep Vencord's **autoUpdate** setting OFF (`settings/settings.json` →
+`"autoUpdate": false`). With it on, any new upstream Vencord release gets
+downloaded over `vencordFiles/` on reload, silently removing this plugin —
+the bridge then reports "plugin DISCONNECTED" until you re-copy the dist.
+If `discord_reload` can't reach a renderer whose plugin is already gone,
+restart Vesktop itself (`osascript -e 'quit app "vesktop"' && open -a vesktop`).
 
 ## MCP tools
 
@@ -245,7 +259,7 @@ discord_send({                          → reply to that specific message
 - `POST /result` — plugin posts `{id, ok, result|error}`.
 - `POST /eval?depth=N` — round-trip raw JS; the smoke-test path:
 
-      curl -s -X POST 'http://localhost:8787/eval?token=vc-debug-bridge-2f9a4c1e' --data-binary 'document.title'
+      curl -s -X POST 'http://localhost:8788/eval?token=vc-debug-bridge-2f9a4c1e' --data-binary 'document.title'
 
 - `POST /screenshot` — body `{selector?, ...}`; captures the renderer, returns
   `{ok, result:{data, mimeType, width, height, bytes}}` (`data` is base64).

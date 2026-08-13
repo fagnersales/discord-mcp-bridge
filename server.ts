@@ -565,6 +565,8 @@ mcp.registerTool("discord_view", {
         "off-screen messages out of the DOM, so if the user scrolls up to look at history, " +
         "*that* slice is what comes back. Each message includes author info (id, username, " +
         "display name, bot flag), content, timestamp, attachments, reply ref, and mentions. " +
+        "Components-V2 messages (bot posts with media galleries) surface their text as " +
+        "`content` and their imagery as `componentMedia` (url/contentType/size per item). " +
         "Each message's top-level `id` is the value to pass as `replyToMessageId` to " +
         "`discord_send` when replying to that specific message. " +
         "`scroll.atBottom` tells you if the user is following live or browsing history. " +
@@ -654,6 +656,8 @@ mcp.registerTool("discord_history", {
         "filters applied after the fetch. Always pass a tight `select` projection — the " +
         "default ([id, content, author, timestamp]) is what you usually want; only widen it " +
         "when you actually need attachments / replyTo / mentions / reactions. " +
+        "The `attachments` projection also surfaces Components-V2 media (bot media " +
+        "galleries/thumbnails/files) as `componentMedia`, and V2 text lands in `content`. " +
         "If `hasMoreBefore` is true, pass `nextBefore` back as `before` to keep paging deeper.",
     inputSchema: {
         channelId: z.string().optional().describe("Target channel ID. Omit to use the currently selected channel."),
@@ -905,7 +909,10 @@ mcp.registerTool("discord_attachment", {
         "Fetch the bytes of a message attachment so the model can actually see/read it — " +
         "for image attachments, the bytes come back as an inline image ContentBlock (so " +
         "the model perceives the image directly); for everything else, base64 in a text " +
-        "block with mime + size. Default `index` is 0 (first attachment). Refuses files " +
+        "block with mime + size. Also covers Components-V2 media (bot media galleries / " +
+        "thumbnails / file components), indexed after the regular attachments — the " +
+        "combined list order matches `componentMedia` from view/history. " +
+        "Default `index` is 0 (first attachment). Refuses files " +
         "larger than `maxBytes` (default 5 MB) — for those, get metadata via " +
         "`discord_view` / `discord_history` with the `attachments` projection instead. " +
         "Use this whenever a message references a screenshot, PDF, or other file the " +
