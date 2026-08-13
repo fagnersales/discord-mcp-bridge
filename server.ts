@@ -1149,6 +1149,68 @@ mcp.registerTool("discord_guilds", {
     return runInRenderer(code, 6);
 });
 
+mcp.registerTool("discord_channels", {
+    description:
+        "List a guild's channels the user can actually see — the discovery step before " +
+        "`discord_history` / `discord_open` / `discord_screenshot` on a server channel. " +
+        "Returns `{guild, count, hiddenNoAccess, channels}` where each channel is " +
+        "`{id, name, type, category, position, topic?, nsfw?, lastMessageAt}` sorted by " +
+        "category then position. `type` is one of text / voice / category-less text / " +
+        "announcement / stage / forum / media — announcement channels are where official " +
+        "server posts live. `topic` (truncated to 300 chars) often carries the server's " +
+        "official copy verbatim. `lastMessageAt` is derived from the channel's last message " +
+        "snowflake — use it to spot active channels. Channels the user lacks VIEW_CHANNEL " +
+        "on are omitted (counted in `hiddenNoAccess`).",
+    inputSchema: {
+        guildId: z.string().regex(/^\d{15,25}$/).describe("Guild ID (from `discord_guilds`)."),
+        types: z.array(z.enum(["text", "voice", "announcement", "stage", "forum", "media"])).optional()
+            .describe("Filter to these channel types. Default: all. E.g. [\"text\",\"announcement\"] skips voice noise."),
+    },
+}, async ({ guildId, types }) => {
+    const argJson = JSON.stringify({ guildId, types });
+    const code = `
+        (() => {
+            const args = ${argJson};
+            const W = globalThis.Vencord?.Webpack;
+            if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+            const GuildStore = W.findByProps("getGuild", "getGuilds");
+            const GuildChannelStore = W.findByProps("getChannels", "getDefaultChannel");
+            const PermissionStore = W.findByProps("can", "canBasicChannel");
+            if (!GuildChannelStore?.getChannels || !PermissionStore?.can)
+                throw new Error("Channel/permission store not found - webpack module shape may have changed.");
+            const guild = GuildStore?.getGuild?.(args.guildId);
+            if (!guild) throw new Error("Not a member of guild " + args.guildId + " (or it is not loaded).");
+            const res = GuildChannelStore.getChannels(args.guildId);
+            const TYPE = { 0: "text", 2: "voice", 4: "category", 5: "announcement", 13: "stage", 15: "forum", 16: "media" };
+            const VIEW_CHANNEL = 1024n;
+            const cats = {};
+            for (const e of (res["4"] ?? [])) cats[e.channel.id] = e.channel.name;
+            const snowflakeToIso = (id) => id ? new Date(Number(BigInt(id) >> 22n) + 1420070400000).toISOString() : null;
+            let hidden = 0;
+            const wanted = args.types?.length ? new Set(args.types) : null;
+            const channels = [];
+            for (const e of [...(res.SELECTABLE ?? []), ...(res.VOCAL ?? [])]) {
+                const c = e.channel;
+                const type = TYPE[c.type] ?? String(c.type);
+                if (wanted && !wanted.has(type)) continue;
+                if (!PermissionStore.can(VIEW_CHANNEL, c)) { hidden++; continue; }
+                channels.push({
+                    id: c.id,
+                    name: c.name,
+                    type,
+                    category: c.parent_id ? (cats[c.parent_id] ?? null) : null,
+                    position: c.position_ ?? c.position ?? 0,
+                    ...(c.topic_ ? { topic: String(c.topic_).slice(0, 300) } : {}),
+                    ...(c.nsfw_ ? { nsfw: true } : {}),
+                    lastMessageAt: snowflakeToIso(c.lastMessageId),
+                });
+            }
+            channels.sort((a, b) => (a.category ?? "").localeCompare(b.category ?? "") || a.position - b.position);
+            return { guild: { id: guild.id, name: guild.name }, count: channels.length, hiddenNoAccess: hidden, channels };
+        })()`;
+    return runInRenderer(code, 6);
+});
+
 mcp.registerTool("discord_mute_guild", {
     description:
         "Mute or unmute a Discord guild/server by guild ID. This changes the same per-server " +
