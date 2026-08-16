@@ -12,7 +12,7 @@ runtime (webpack modules, the DOM, minified class names) instead of guessing.
 The bridge is split so the MCP tools **always** connect, no matter how many
 Claude Code sessions are open:
 
-1. **`daemon.ts`** — owns `0.0.0.0:8788` and the long-poll connection to the
+1. **`daemon.ts`** — owns `127.0.0.1:8788` and the long-poll connection to the
    Vencord plugin. Long-lived and a **singleton**: only one process can bind
    the port; a second daemon loses the race and exits. Started **detached**
    (`setsid`) so it survives the Claude Code session that spawned it — and a

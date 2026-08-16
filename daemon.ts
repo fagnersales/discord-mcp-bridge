@@ -2,7 +2,7 @@
 /**
  * discord-bridge daemon
  * ---------------------
- * Owns :8787 and the long-poll connection to the Vencord "DiscordMCP" plugin.
+ * Owns :8788 and the long-poll connection to the Vencord "DiscordMCP" plugin.
  *
  * It is long-lived and a singleton: only one process can bind the port, and a
  * second daemon exits immediately on EADDRINUSE. server.ts (the per-session
@@ -16,8 +16,8 @@
 
 import { appendFileSync } from "fs";
 
-const PORT = 8787;
-const HOST = "0.0.0.0";                       // reachable from Windows-side Discord
+const PORT = 8788;
+const HOST = "127.0.0.1";                     // renderer and companion are local
 const TOKEN = "vc-debug-bridge-2f9a4c1e";     // shared secret — must match the plugin
 const CALL_TIMEOUT_MS = 12_000;               // how long a tool call waits for a result
 const POLL_HOLD_MS = 25_000;                  // how long /poll is held open with no work
