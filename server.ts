@@ -1218,6 +1218,119 @@ mcp.registerTool("discord_channels", {
     return runInRenderer(code, 6);
 });
 
+mcp.registerTool("discord_roles", {
+    description:
+        "List a guild's roles in display order (highest first) — the discovery step before " +
+        "`discord_role_members`. Returns `{guild, count, loadedMembers, roles}` where each role is " +
+        "`{id, name, color, hoist, managed, position, loadedMembers}`. `hoist: true` means the role " +
+        "gets its own section in the member sidebar. `managed: true` marks bot/integration roles. " +
+        "`loadedMembers` counts only members the client has already loaded (sidebar, chat authors), " +
+        "not the server total. Pass `query` to keep roles whose name contains it (case-insensitive).",
+    inputSchema: {
+        guildId: z.string().regex(/^\d{15,25}$/).describe("Guild ID (from `discord_guilds`)."),
+        query: z.string().optional().describe("Case-insensitive substring filter on the role name."),
+    },
+}, async ({ guildId, query }) => {
+    const argJson = JSON.stringify({ guildId, query });
+    const code = `
+        (() => {
+            const args = ${argJson};
+            const W = globalThis.Vencord?.Webpack;
+            if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+            const GuildStore = W.findByProps("getGuild", "getGuilds");
+            const RoleStore = W.findStore?.("GuildRoleStore") ?? W.findByProps("getUnsafeMutableRoles", "getRole");
+            const MemberStore = W.findStore?.("GuildMemberStore") ?? W.findByProps("getMember", "getMemberIds");
+            if (!RoleStore?.getUnsafeMutableRoles || !MemberStore?.getMembers)
+                throw new Error("Role/member store not found - webpack module shape may have changed.");
+            const guild = GuildStore?.getGuild?.(args.guildId);
+            if (!guild) throw new Error("Not a member of guild " + args.guildId + " (or it is not loaded).");
+            const members = MemberStore.getMembers(args.guildId) ?? [];
+            const counts = {};
+            for (const m of members) for (const r of (m.roles ?? [])) counts[r] = (counts[r] ?? 0) + 1;
+            const q = args.query?.trim().toLowerCase();
+            const roles = Object.values(RoleStore.getUnsafeMutableRoles(args.guildId) ?? {})
+                .filter(r => !q || String(r.name).toLowerCase().includes(q))
+                .sort((a, b) => (b.position ?? 0) - (a.position ?? 0))
+                .map(r => ({
+                    id: r.id,
+                    name: String(r.name).trim(),
+                    color: r.color ? "#" + r.color.toString(16).padStart(6, "0") : null,
+                    hoist: !!r.hoist,
+                    managed: !!r.managed,
+                    position: r.position ?? 0,
+                    loadedMembers: r.id === args.guildId ? members.length : (counts[r.id] ?? 0),
+                }));
+            return { guild: { id: guild.id, name: guild.name }, count: roles.length, loadedMembers: members.length, roles };
+        })()`;
+    return runInRenderer(code, 6);
+});
+
+mcp.registerTool("discord_role_members", {
+    description:
+        "List members holding any of the given roles in a guild. Reads only members the client has " +
+        "**already loaded** — it never requests the member list from Discord. To see more, scroll the " +
+        "member sidebar first: hoisted roles (`hoist: true` in `discord_roles`) show as their own " +
+        "sidebar sections, so scrolling to them loads those members. Non-hoisted roles only show up " +
+        "for members loaded some other way (e.g. message authors). `roles` takes role IDs or " +
+        "case-insensitive name substrings (from `discord_roles`). Returns " +
+        "`{guild, matchedRoles, loadedMembers, count, members}` where each member is " +
+        "`{id, username, name, roles}` and `roles` lists the matched role names they hold.",
+    inputSchema: {
+        guildId: z.string().regex(/^\d{15,25}$/).describe("Guild ID (from `discord_guilds`)."),
+        roles: z.array(z.string().min(1)).min(1).max(50)
+            .describe("Role IDs, or case-insensitive substrings of role names. A member matches if they hold any of them."),
+        limit: z.number().int().min(1).max(1000).optional().describe("Max members to return (default 200)."),
+    },
+}, async ({ guildId, roles, limit }) => {
+    const argJson = JSON.stringify({ guildId, roles, limit: limit ?? 200 });
+    const code = `
+        (() => {
+            const args = ${argJson};
+            const W = globalThis.Vencord?.Webpack;
+            if (!W?.findByProps) throw new Error("Vencord.Webpack is not ready yet.");
+            const GuildStore = W.findByProps("getGuild", "getGuilds");
+            const UserStore = W.findByProps("getCurrentUser", "getUser");
+            const RoleStore = W.findStore?.("GuildRoleStore") ?? W.findByProps("getUnsafeMutableRoles", "getRole");
+            const MemberStore = W.findStore?.("GuildMemberStore") ?? W.findByProps("getMember", "getMemberIds");
+            if (!RoleStore?.getUnsafeMutableRoles || !MemberStore?.getMembers)
+                throw new Error("Role/member store not found - webpack module shape may have changed.");
+            const guild = GuildStore?.getGuild?.(args.guildId);
+            if (!guild) throw new Error("Not a member of guild " + args.guildId + " (or it is not loaded).");
+            const all = Object.values(RoleStore.getUnsafeMutableRoles(args.guildId) ?? {});
+            const wanted = new Map();
+            for (const raw of args.roles) {
+                const k = raw.trim();
+                const hits = /^\\d{15,25}$/.test(k)
+                    ? all.filter(r => r.id === k)
+                    : all.filter(r => String(r.name).toLowerCase().includes(k.toLowerCase()));
+                for (const r of hits) if (r.id !== args.guildId) wanted.set(r.id, String(r.name).trim());
+            }
+            if (!wanted.size) throw new Error("No roles matched " + JSON.stringify(args.roles) + " - list them with discord_roles.");
+            const loaded = MemberStore.getMembers(args.guildId) ?? [];
+            const members = [];
+            for (const m of loaded) {
+                const held = (m.roles ?? []).filter(r => wanted.has(r));
+                if (!held.length) continue;
+                const u = UserStore?.getUser?.(m.userId);
+                members.push({
+                    id: m.userId,
+                    username: u?.username ?? null,
+                    name: m.nick || u?.globalName || u?.username || null,
+                    roles: held.map(r => wanted.get(r)),
+                });
+            }
+            return {
+                guild: { id: guild.id, name: guild.name },
+                matchedRoles: [...wanted].map(([id, name]) => ({ id, name })),
+                loadedMembers: loaded.length,
+                count: members.length,
+                truncated: members.length > args.limit,
+                members: members.slice(0, args.limit),
+            };
+        })()`;
+    return runInRenderer(code, 6);
+});
+
 mcp.registerTool("discord_mute_guild", {
     description:
         "Mute or unmute a Discord guild/server by guild ID. This changes the same per-server " +
