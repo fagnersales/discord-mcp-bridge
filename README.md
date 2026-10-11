@@ -116,6 +116,17 @@ restart Vesktop itself (`osascript -e 'quit app "vesktop"' && open -a vesktop`).
   `color` is a 24-bit RGB integer (the Discord folder swatch). A separate
   `orphans` array lists guilds the user is in but not referenced by any
   entry (Discord parks newly-joined guilds there).
+- `discord_roles({guildId, query?})` — list a guild's roles, highest first:
+  `{id, name, color, hoist, managed, position, loadedMembers}`. `hoist: true`
+  roles get their own member-sidebar section. `loadedMembers` counts only
+  members the client has already loaded, not the server total. `query` is a
+  case-insensitive substring filter on the role name.
+- `discord_role_members({guildId, roles, limit?})` — list members holding any
+  of `roles` (role IDs or case-insensitive name substrings). Reads only members
+  the client has **already loaded** and never requests the member list from
+  Discord, so scroll the member sidebar to the role's section first (works for
+  hoisted roles). Returns `{guild, matchedRoles, loadedMembers, count, members}`
+  with each member as `{id, username, name, roles}`.
 - `discord_waitForMessage({channelId?, fromUserId?, contains?, mentionsViewer?, includeSelf?, maxMatches?, timeoutMs?})`
   — block until a new Discord message arrives that matches the filter (or until
   `timeoutMs` elapses, default 60 s, max 10 min). Subscribes inside the renderer
